@@ -1499,13 +1499,18 @@ class PowerMeterApp:
         proto_frame.pack(fill="x", pady=(4, 0))
         ttk.Label(proto_frame, text="Protocol:").pack(side="left")
         ttk.Radiobutton(proto_frame, text="BLE", variable=proto_var,
-                        value="BLE").pack(side="left")
+                        value="BLE",
+                        command=lambda s=slot_id: self._on_protocol_changed(s)
+                        ).pack(side="left")
         ttk.Radiobutton(proto_frame, text="ANT+", variable=proto_var,
-                        value="ANT+").pack(side="left")
+                        value="ANT+",
+                        command=lambda s=slot_id: self._on_protocol_changed(s)
+                        ).pack(side="left")
 
         # Device picker. For BLE this is a dropdown of scanned MACs;
         # for ANT+ this is an entry where the user types the device ID.
-        ttk.Label(frame, text="Device:").pack(anchor="w", pady=(8, 0))
+        device_label_var = tk.StringVar(value="Device (BLE MAC, or pick from Scan):")
+        ttk.Label(frame, textvariable=device_label_var).pack(anchor="w", pady=(8, 0))
         device_var = tk.StringVar()
         device_combo = ttk.Combobox(frame, textvariable=device_var, width=24)
         device_combo.pack(fill="x")
@@ -1618,6 +1623,7 @@ class PowerMeterApp:
             "proto_var": proto_var,
             "device_var": device_var,
             "device_combo": device_combo,
+            "device_label_var": device_label_var,
             "scan_btn": scan_btn,
             "connect_btn": connect_btn,
             "disconnect_btn": disconnect_btn,
@@ -1642,6 +1648,31 @@ class PowerMeterApp:
             "cmd_status_var": cmd_status_var,
             "cmd_status_label": cmd_status_label,
         }
+
+    # -- Protocol toggle -----------------------------------------------------
+
+    def _on_protocol_changed(self, slot_id: int):
+        """Clear the device picker when the protocol switches.
+
+        Without this, a `Garmin Vector  [AA:BB:CC:DD:EE:FF]` label left over
+        from a BLE scan stays in the entry after the user flips to ANT+, and
+        Connect throws "ANT+ device ID must be a number" because that label
+        clearly isn't an integer. Wiping the picker on toggle removes the
+        most common path into that error.
+        """
+        sw = self._widgets(slot_id)
+        if sw is None:
+            return
+        proto = sw["proto_var"].get()
+        sw["device_var"].set("")
+        sw["device_combo"]["values"] = []
+        sw["scan_results"] = []
+        if proto == "BLE":
+            sw["device_label_var"].set("Device (BLE MAC, or pick from Scan):")
+        else:
+            sw["device_label_var"].set(
+                "Device (ANT+ device ID, e.g. 12345; 0 = pair with first found):"
+            )
 
     # -- Scanning ------------------------------------------------------------
 
@@ -1733,11 +1764,23 @@ class PowerMeterApp:
             if not OPENANT_AVAILABLE:
                 messagebox.showerror("ANT+ missing", "pip install openant (and plug in a USB ANT+ stick)")
                 return
-            try:
-                device_id = int(device_text)
-            except ValueError:
-                messagebox.showerror("Bad ANT+ ID",
-                                     "ANT+ device ID must be a number (0 to pair with first found).")
+            device_id = self._parse_ant_device_id(device_text)
+            if device_id is None:
+                messagebox.showerror(
+                    "Bad ANT+ ID",
+                    f"Couldn't read an ANT+ device ID from {device_text!r}.\n\n"
+                    "Enter a plain integer (e.g. 12345). Use 0 to pair with the "
+                    "first power meter found.\n\n"
+                    "Tip: if you just switched from BLE, the field may still "
+                    "hold a scan label like 'Garmin  [AA:BB:..]'. Clear it and "
+                    "type the device ID printed on/in your meter's app.",
+                )
+                return
+            if not 0 <= device_id <= 0xFFFF:
+                messagebox.showerror(
+                    "Bad ANT+ ID",
+                    f"ANT+ device ID {device_id} is out of range (0-65535).",
+                )
                 return
             slot.address_or_id = str(device_id)
             slot.name = f"ANT+ {device_id}"
@@ -1761,6 +1804,31 @@ class PowerMeterApp:
         sw["status_label"].config(foreground="orange")
         sw["connect_btn"].config(state="disabled")
         sw["disconnect_btn"].config(state="normal")
+
+    @staticmethod
+    def _parse_ant_device_id(text: str) -> Optional[int]:
+        """Read an ANT+ device ID out of the picker. Lenient on whitespace,
+        accepts decimal or `0x..` hex. Returns None if no integer is found."""
+        s = text.strip()
+        if not s:
+            return None
+        # Accept hex form (rare but harmless: ANT+ stick logs sometimes show
+        # the ID this way).
+        try:
+            if s.lower().startswith("0x"):
+                return int(s, 16)
+            return int(s)
+        except ValueError:
+            pass
+        # Last resort: pull the first contiguous run of digits out. Catches
+        # cases like "12345 (Garmin Vector)" if the user pasted a label.
+        m = re.search(r"\d+", s)
+        if m:
+            try:
+                return int(m.group(0))
+            except ValueError:
+                return None
+        return None
 
     def _extract_ble_address(self, sw, text: str) -> str:
         """Find the MAC address either inside the [brackets] or matching by name."""
