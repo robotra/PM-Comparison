@@ -819,6 +819,37 @@ class AsyncLoopThread:
 # ANT+ worker - runs in its own thread
 # ---------------------------------------------------------------------------
 
+def _antplus_error_hint(kind: str, msg: str) -> str:
+    """Translate an openant/libusb exception into a one-liner the user can
+    actually act on. Empty string when we don't recognise the failure."""
+    k = (kind or "").lower()
+    m = (msg or "").lower()
+
+    # libusb backend missing - by far the most common Windows symptom and the
+    # one that typically lands here with an empty exception message.
+    if "nobackend" in k or "no backend" in m or ("libusb" in m and "not found" in m):
+        return ("libusb backend not found. On Windows, install a libusb-1.0 "
+                "DLL (e.g. via `pip install libusb` or the Zadig setup) and "
+                "make sure the ANT+ stick is bound to the WinUSB driver in "
+                "Zadig. On Linux, install libusb-1.0-0.")
+    # No ANT+ stick plugged in / OS doesn't see it.
+    if "no such device" in m or "ant" in m and "not found" in m:
+        return ("No ANT+ USB stick detected. Plug it in (or try a different "
+                "port) and retry.")
+    # Stick is present but the driver isn't WinUSB - openant can't talk to it.
+    if "access" in m and ("denied" in m or "permission" in m):
+        return ("USB access denied. On Windows, run Zadig and replace the "
+                "stick's driver with WinUSB. On Linux, add a udev rule or "
+                "run as a user in the `plugdev` group.")
+    if "resource busy" in m or "busy" in m:
+        return ("ANT+ stick is busy. Close Garmin Express / ANT Agent / "
+                "any other app that grabs the stick, then retry.")
+    if "timeout" in m:
+        return ("ANT+ pairing timed out. Pedal once to wake the meter, "
+                "double-check the device ID, and retry.")
+    return ""
+
+
 def antplus_meter_task(slot: MeterSlot, device_id: int, reading_queue: queue.Queue,
                        stop_event: threading.Event):
     """
@@ -921,12 +952,26 @@ def antplus_meter_task(slot: MeterSlot, device_id: int, reading_queue: queue.Que
             try:
                 cmd()
             except Exception as e:
+                text = str(e).strip()
+                kind = type(e).__name__
+                full = f"{kind}: {text}" if text else kind
                 reading_queue.put(
-                    ("ERROR", slot.slot_id, f"ANT+ command error: {e}")
+                    ("ERROR", slot.slot_id, f"ANT+ command error: {full}")
                 )
 
     except Exception as e:
-        reading_queue.put(("ERROR", slot.slot_id, f"ANT+ error: {e}"))
+        # Many openant / libusb errors have no useful str() (NoBackendError
+        # is the worst offender - it raises with an empty message). Always
+        # include the exception type so "ANT+ error: " can never reach the
+        # user, and stitch on a hint for the cases users actually hit.
+        text = str(e).strip()
+        kind = type(e).__name__
+        full = f"{kind}: {text}" if text else kind
+        hint = _antplus_error_hint(kind, text)
+        msg = f"ANT+ error: {full}"
+        if hint:
+            msg += f"\n\n{hint}"
+        reading_queue.put(("ERROR", slot.slot_id, msg))
     finally:
         # Clean shutdown - openant is finicky, so wrap each step in try.
         try:
