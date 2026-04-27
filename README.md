@@ -24,11 +24,14 @@ Built for hobbyist comparison — A/B-ing two meters, validating drift, sanity-c
 - `bleak` (BLE)
 - `openant` (ANT+, optional)
 - For ANT+: a USB ANT+ stick (Garmin, Suunto, CycPlus) and on Windows the Zadig driver swap
+- For ANT+ on Windows: the `libusb` pip package (ships the DLL openant needs)
 
 ```bash
-pip install bleak openant
+pip install bleak openant libusb
 python power_meter_app.py
 ```
+
+The app auto-registers the libusb DLL bundled in the `libusb` pip package on Windows (so you won't see *"ANT+ driver not found"* / `NoBackendError`), but it can't bypass the Zadig driver swap — the OS-level driver still has to be WinUSB before openant can talk to the stick.
 
 The app launches even if one of the libraries is missing — the status bar at the top tells you which protocols are available.
 

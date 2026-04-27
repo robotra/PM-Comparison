@@ -50,6 +50,55 @@ try:
 except ImportError:
     BLEAK_AVAILABLE = False
 
+def _ensure_libusb_dll_path():
+    """Register the bundled libusb-1.0 DLL on Windows so pyusb (and therefore
+    openant) can find it.
+
+    Background: openant talks to the ANT+ stick via pyusb, which uses ctypes
+    to dlopen `libusb-1.0`. On Linux/macOS the system loader handles this. On
+    Windows there's no system libusb - users typically `pip install libusb`,
+    which ships precompiled per-arch DLLs inside the package, but does NOT
+    add them to the DLL search path. The result: pyusb's `get_backend()`
+    silently returns None and openant raises `NoBackendError` with an empty
+    message, which from the user's seat reads "ANT+ driver not found."
+
+    Fix: locate the bundled DLL and call `os.add_dll_directory` on it before
+    pyusb imports. No-op on non-Windows or if the `libusb` package isn't
+    installed (in which case the user is on their own to provide the DLL,
+    e.g. via Zadig's libusb runtime).
+    """
+    import sys
+    if sys.platform != "win32":
+        return
+    try:
+        import libusb  # provided by `pip install libusb`
+    except ImportError:
+        return
+    import os
+    import platform
+    machine = platform.machine().lower()
+    if machine in ("arm64", "aarch64"):
+        arch = "arm64"
+    elif sys.maxsize > 2 ** 32:
+        arch = "x86_64"
+    else:
+        arch = "x86"
+    dll_dir = os.path.join(os.path.dirname(libusb.__file__),
+                           "_platform", "windows", arch)
+    if not os.path.isdir(dll_dir):
+        return
+    try:
+        os.add_dll_directory(dll_dir)
+    except (FileNotFoundError, OSError):
+        pass
+    # Also prepend to PATH so any code that searches the env (rather than
+    # going through the dll-directory list) still finds it.
+    os.environ["PATH"] = dll_dir + os.pathsep + os.environ.get("PATH", "")
+
+
+# Run before importing openant so its lazy-loaded pyusb backend resolves.
+_ensure_libusb_dll_path()
+
 try:
     from openant.easy.node import Node
     from openant.devices import ANTPLUS_NETWORK_KEY
