@@ -1764,8 +1764,8 @@ class PowerMeterApp:
             if not OPENANT_AVAILABLE:
                 messagebox.showerror("ANT+ missing", "pip install openant (and plug in a USB ANT+ stick)")
                 return
-            device_id = self._parse_ant_device_id(device_text)
-            if device_id is None:
+            raw_id = self._parse_ant_device_id(device_text)
+            if raw_id is None or raw_id < 0:
                 messagebox.showerror(
                     "Bad ANT+ ID",
                     f"Couldn't read an ANT+ device ID from {device_text!r}.\n\n"
@@ -1776,14 +1776,22 @@ class PowerMeterApp:
                     "type the device ID printed on/in your meter's app.",
                 )
                 return
-            if not 0 <= device_id <= 0xFFFF:
-                messagebox.showerror(
-                    "Bad ANT+ ID",
-                    f"ANT+ device ID {device_id} is out of range (0-65535).",
-                )
-                return
+            # ANT+ channel device numbers are 16-bit. A handful of meters
+            # (Garmin pedals in particular) print the full 32-bit hardware
+            # serial - that number won't fit in the channel-ID slot, but the
+            # low 16 bits are what actually pair on the air. Mask quietly
+            # rather than rejecting; surface the resolved ID in the name so
+            # the user can sanity-check against their head unit.
+            device_id = raw_id & 0xFFFF
             slot.address_or_id = str(device_id)
-            slot.name = f"ANT+ {device_id}"
+            if device_id == raw_id:
+                slot.name = f"ANT+ {device_id}"
+            else:
+                slot.name = f"ANT+ {device_id} (from {raw_id})"
+                print(
+                    f"[Slot {slot_id}] ANT+ ID {raw_id} > 0xFFFF; "
+                    f"using low 16 bits ({device_id}) for channel match."
+                )
             t = threading.Thread(
                 target=antplus_meter_task,
                 args=(slot, device_id, self.reading_queue, stop_event),
