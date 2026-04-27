@@ -1,15 +1,16 @@
 # Multi Power Meter
 
-A desktop app to connect up to **3 cycling power meters at once** over Bluetooth Low Energy (BLE) and/or ANT+, see live power side-by-side, log to CSV, and run calibration (zero offset and crank length) without needing a head unit.
+A desktop app to connect to an **arbitrary number of cycling power meters at once** over Bluetooth Low Energy (BLE) and/or ANT+, see live power side-by-side, log to CSV, run calibration (zero offset and crank length), and **drive a smart trainer in ERG mode** — all without a head unit.
 
-Built for hobbyist comparison — A/B-ing two meters, validating drift, or sanity-checking a freshly-installed crankset.
+Built for hobbyist comparison — A/B-ing two meters, validating drift, sanity-checking a freshly-installed crankset, or running a structured workout against a smart trainer.
 
 ## Features
 
-- **3 simultaneous meters** in any mix of BLE and ANT+
+- **Arbitrary number of meters** in any mix of BLE and ANT+, scrollable horizontally; add and remove slots on the fly
 - **Live readouts** of power (W) and cadence (rpm) at ~10 Hz UI refresh
 - **Side-by-side spread** between connected meters (`max - min`, percentage)
 - **CSV recording** with millisecond timestamps and elapsed-seconds column for easy plotting
+- **Smart trainer control (FTMS)** — when a connected device exposes the Fitness Machine Service, an inline panel appears in its slot with quick `Set` / `±25 W` / `Stop` buttons and a plain-text command box (see [Trainer commands](#trainer-commands))
 - **Calibration dialog**:
   - Read / set crank length (BLE Cycling Power Control Point, ANT+ Page 0x02 sub 0x01)
   - Run zero-offset compensation with raw-offset readback (color-coded: green ≤50, orange ≤100, red >100)
@@ -57,6 +58,53 @@ Open *Calibrate...* on a connected slot. Two operations:
 
 For BLE, calibration uses the standard Cycling Power Control Point characteristic. For ANT+, it uses the standard Bicycle Power profile pages. ANT+ behavior varies by pedal; if calibration silently times out, your `openant` version may not expose the generic page hook this app uses.
 
+> **Garmin Vector / Rally pedals (and similar dual-protocol meters):** these often expose calibration *only* over ANT+, and respond to BLE calibration requests with `Operation not supported`. If a BLE calibration is rejected, switch the slot's protocol to ANT+ and try again.
+
+## Trainer commands
+
+When a slot connects to a device that supports the BLE Fitness Machine Service (KICKR, Neo, Saris H3, Tacx, JetBlack, Wattbike Atom, etc.), a *Trainer (ERG)* panel appears inside its frame. The plain-text command box accepts ad-hoc workout phrases — type and hit Enter (or *Run*).
+
+### Three example workouts
+
+```
+ramp from 100 to 200w over 10min
+```
+A **10-minute warmup ramp**: target power slides linearly from 100 W to 200 W. Internally the ramp is sliced into ~5-second steps and each step is sent as a Set Target Power command.
+
+```
+alternate between 220 and 130w every 5min
+```
+**Sweet-spot intervals**: 5 minutes at 220 W, 5 minutes at 130 W, repeating until you hit *Stop* or *Cancel workout*. Useful for unbounded interval sets where you decide afterwards how long the session lasted.
+
+```
+100w for 5min, 200w for 20min, 100w for 5min
+```
+**Stepped workout** (warmup + 20-min work + cooldown). A finite step program — runs once and reports "Workout complete." when finished. Append `, repeat` to make any sequence loop.
+
+### Parsing guidelines
+
+The parser is case-insensitive, whitespace-tolerant, and supports the following forms:
+
+| You type | What it does |
+|----------|--------------|
+| `200w`, `200`, `200 watts` | Hold target at 200 W |
+| `+25`, `-50` | Adjust the current target by ±N W |
+| `stop`, `off`, `pause` | Drop ERG mode (rider can freewheel) |
+| `alternate between A and B[w] every <duration>` | Two-step loop, fixed duration each side |
+| `ramp [from] A to B[w] (over\|in) <duration>` | Linear power ramp in 5-second steps |
+| `Aw for <dur>, Bw for <dur>[, ...]` | Step program; separators: `,` or ` then ` |
+| `... , repeat` (suffix) | Make a step program loop forever |
+
+**Watts** — the trailing `w` / `watts` is optional everywhere. Any bare integer in a watts position is read as watts.
+
+**Durations** — use `s`/`sec`/`seconds`, `m`/`min`/`minutes`, or `h`/`hr`/`hours`. Composite forms work: `1h30m`, `2m30s`. A bare number with no unit is read as seconds.
+
+**Bounds** — the trainer's advertised power range (when present) is used to clamp targets, so `9999w` on a trainer that maxes at 2000 W will be sent as 2000 W. The active step is shown in the trainer panel's status line so you can see what's running.
+
+**Stopping** — *Cancel workout* stops the schedule but leaves the trainer holding the last commanded target. *Stop* drops ERG entirely. Disconnecting cancels both automatically.
+
+**What's not supported (yet)** — repeat counts (e.g. `4x...`), simulation/grade commands, FTP-relative targets (`80%FTP`). They're parser features, not trainer-protocol limits, so additions are mostly local to `parse_trainer_command` in [power_meter_app.py](power_meter_app.py).
+
 ## CSV format
 
 ```
@@ -95,7 +143,7 @@ If `openant` doesn't get bundled correctly, add `--collect-all openant`.
 
 - **No power balance** — left/right balance from dual-sided meters is not parsed or shown.
 - **No cadence over BLE** — the spec carries it but extracting it requires tracking crank revolutions across notifications. ANT+ provides cadence directly and that one *is* shown.
-- **Multiple ANT+ meters on one stick** — the worker opens its own Node per slot, so multiple ANT+ slots want multiple sticks. Mixing one ANT+ + two BLE on a single stick works fine.
+- **Multiple ANT+ meters on one stick** — the worker opens its own Node per slot, so multiple ANT+ slots want multiple sticks. Mixing one ANT+ slot with several BLE slots on a single stick works fine.
 - **ANT+ calibration is best-effort** — page formats follow the spec, but pedal implementations vary. Verify with your head unit before trusting an in-app result.
 
 ## Troubleshooting
@@ -103,5 +151,6 @@ If `openant` doesn't get bundled correctly, add `--collect-all openant`.
 - **BLE scan finds nothing** — Bluetooth is off, or the meter isn't advertising (some meters only advertise after a wake-up pedal stroke).
 - **ANT+ "no device found"** — wrong driver. On Windows, run Zadig and replace the Garmin/Dynastream USB driver with WinUSB.
 - **Calibration says "Operation not permitted"** — the meter is asleep. Pedal once and retry.
-- **Calibration says "Operation not supported"** — the meter genuinely doesn't expose this command. Use Garmin Connect or your head unit instead.
+- **Calibration says "Operation not supported"** — the meter doesn't expose that command on this protocol. Garmin Vector/Rally and similar dual-protocol pedals usually expose calibration only on ANT+; switch the slot to ANT+ and retry. Otherwise fall back to Garmin Connect / your head unit.
+- **Trainer panel never appears** — the device you connected doesn't expose the BLE Fitness Machine Service (`0x1826`). Some smart trainers expose FTMS only when not paired to another app — quit Zwift/TrainerRoad and reconnect.
 - **Buttons frozen during connect** — fixed. If you still see this, you're running an older revision; pull the latest [power_meter_app.py](power_meter_app.py).

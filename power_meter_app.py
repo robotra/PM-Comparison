@@ -1,9 +1,11 @@
 """
 Multi Power Meter App
 =====================
-Connect to up to 3 cycling power meters simultaneously over Bluetooth Low
-Energy (BLE) and/or ANT+. Displays live power, logs to CSV, and shows a
-side-by-side comparison.
+Connect to an arbitrary number of cycling power meters simultaneously over
+Bluetooth Low Energy (BLE) and/or ANT+. Displays live power, logs to CSV,
+shows a side-by-side comparison, and exposes ERG-mode controls for any
+connected meter that also implements the BLE Fitness Machine Service
+(typical of smart trainers like KICKR, Neo, Saris H3, Tacx, JetBlack, etc.).
 
 Architecture overview
 ---------------------
@@ -30,6 +32,7 @@ import asyncio
 import csv
 import json
 import queue
+import re
 import threading
 import time
 import tkinter as tk
@@ -89,9 +92,58 @@ CP_RESULT_NAMES = {
     CP_RESULT_NOT_PERMITTED: "Operation not permitted",
 }
 
-# Feature flag bits in the Cycling Power Feature characteristic.
-CP_FEATURE_OFFSET_COMPENSATION = 1 << 3
-CP_FEATURE_CRANK_LENGTH_ADJUSTMENT = 1 << 4
+# Feature flag bits in the Cycling Power Feature characteristic, per the BLE
+# Cycling Power Service spec v1.1 section 3.4. The previous values here were
+# off (bits 3 and 4 are Crank Revolution Data Supported and Extreme Magnitudes
+# Supported, not the calibration features), which manifested as some meters
+# either falsely passing the gate or - on Garmin pedals etc. - getting the
+# button enabled and then refused at the control point with "Operation not
+# supported". The correct bits:
+#   bit 9  - Offset Compensation Supported
+#   bit 12 - Crank Length Adjustment Supported
+CP_FEATURE_OFFSET_COMPENSATION = 1 << 9
+CP_FEATURE_CRANK_LENGTH_ADJUSTMENT = 1 << 12
+
+# --- Fitness Machine Service (FTMS) - smart trainer control ---------------
+# Standard BLE service every modern smart trainer exposes. Lets us drive ERG
+# mode (target power), simulation (slope/wind/Crr), or raw resistance level.
+FITNESS_MACHINE_SERVICE_UUID = "00001826-0000-1000-8000-00805f9b34fb"
+FITNESS_MACHINE_FEATURE_UUID = "00002acc-0000-1000-8000-00805f9b34fb"
+FITNESS_MACHINE_CONTROL_POINT_UUID = "00002ad9-0000-1000-8000-00805f9b34fb"
+FITNESS_MACHINE_STATUS_UUID = "00002ada-0000-1000-8000-00805f9b34fb"
+SUPPORTED_POWER_RANGE_UUID = "00002ad8-0000-1000-8000-00805f9b34fb"
+SUPPORTED_RESISTANCE_RANGE_UUID = "00002ad6-0000-1000-8000-00805f9b34fb"
+
+# FTMS Control Point opcodes.
+FTMS_OP_REQUEST_CONTROL = 0x00
+FTMS_OP_RESET = 0x01
+FTMS_OP_SET_TARGET_RESISTANCE = 0x04
+FTMS_OP_SET_TARGET_POWER = 0x05
+FTMS_OP_START_RESUME = 0x07
+FTMS_OP_STOP_PAUSE = 0x08
+FTMS_OP_SET_SIM_PARAMS = 0x11
+FTMS_OP_RESPONSE_CODE = 0x80
+
+FTMS_RESULT_SUCCESS = 0x01
+FTMS_RESULT_OP_NOT_SUPPORTED = 0x02
+FTMS_RESULT_INVALID_PARAMETER = 0x03
+FTMS_RESULT_OP_FAILED = 0x04
+FTMS_RESULT_CONTROL_NOT_PERMITTED = 0x05
+
+FTMS_RESULT_NAMES = {
+    FTMS_RESULT_SUCCESS: "Success",
+    FTMS_RESULT_OP_NOT_SUPPORTED: "Operation not supported",
+    FTMS_RESULT_INVALID_PARAMETER: "Invalid parameter",
+    FTMS_RESULT_OP_FAILED: "Operation failed",
+    FTMS_RESULT_CONTROL_NOT_PERMITTED: "Control not permitted (request control first)",
+}
+
+# Bits in the Fitness Machine Features lower 32-bit field that matter to us.
+FTMS_FEATURE_POWER_TARGET_SUPPORTED = 1 << 14   # actually in target-features
+# Target-features (second uint32 of FTMS Feature characteristic).
+FTMS_TARGET_FEATURE_RESISTANCE = 1 << 0
+FTMS_TARGET_FEATURE_POWER = 1 << 1
+FTMS_TARGET_FEATURE_SIM = 1 << 13
 
 # Persisted state (last-used crank length per meter, etc.) lives here.
 CONFIG_PATH = Path.home() / ".power_meter_app.json"
@@ -104,7 +156,7 @@ CONFIG_PATH = Path.home() / ".power_meter_app.json"
 @dataclass
 class PowerReading:
     """A single power reading from a meter, tagged with which slot it came from."""
-    slot: int           # 1, 2, or 3 - which UI slot/meter this belongs to
+    slot: int           # slot_id of the meter that produced this reading
     timestamp: float    # Unix time when we received the reading
     power_watts: int    # Instantaneous power in watts
     cadence_rpm: Optional[float] = None  # Optional, not all meters provide it
@@ -112,7 +164,12 @@ class PowerReading:
 
 @dataclass
 class MeterSlot:
-    """Holds the runtime state of one of the three meter slots."""
+    """Holds the runtime state of a single meter slot.
+
+    Slot IDs are assigned monotonically by the app and never reused, so a
+    queued reading from a removed slot is silently dropped rather than
+    reappearing in some new slot that happens to share its number.
+    """
     slot_id: int
     protocol: str = "BLE"           # "BLE" or "ANT+"
     address_or_id: str = ""         # BLE MAC address or ANT+ device number
@@ -135,6 +192,19 @@ class MeterSlot:
     ant_device: Optional[object] = field(default=None, repr=False)
     ant_command_queue: Optional[queue.Queue] = field(default=None, repr=False)
     ant_pending: dict = field(default_factory=dict, repr=False)
+
+    # --- FTMS (smart trainer) state ---
+    # `ftms_available` is set by the BLE worker after it confirms the
+    # Fitness Machine Service exists on the connected device. The slot's
+    # trainer panel stays hidden until this flag flips True.
+    ftms_available: bool = False
+    ftms_target_features: int = 0                           # Target-features bitfield
+    ftms_power_min: Optional[int] = None
+    ftms_power_max: Optional[int] = None
+    ftms_resistance_min: Optional[float] = None
+    ftms_resistance_max: Optional[float] = None
+    ftms_target_power_w: Optional[int] = None               # Last commanded target
+    ftms_responses: dict = field(default_factory=dict, repr=False)
 
 
 # ---------------------------------------------------------------------------
@@ -166,6 +236,193 @@ def parse_cycling_power_measurement(data: bytearray) -> tuple[int, Optional[floa
     power = int.from_bytes(data[2:4], byteorder="little", signed=True)
     power = max(0, power)
     return power, None
+
+
+# ---------------------------------------------------------------------------
+# Plain-text workout parser
+# ---------------------------------------------------------------------------
+#
+# The trainer panel exposes a single text box. We accept terse, ad-hoc
+# phrases instead of a structured DSL so it's quick to type during a ride:
+#
+#   200w                                       -> hold 200 W
+#   200                                        -> hold 200 W (units optional)
+#   +25 / -50                                  -> nudge target by N watts
+#   stop                                       -> drop ERG
+#   alternate between 150 and 200w every 1min  -> 1min @ 150, 1min @ 200, repeat
+#   ramp from 150 to 250w over 5min            -> linear interpolation in 5s steps
+#   200w for 2min, 150w for 30sec, repeat      -> step program (optional ", repeat")
+#
+# The parser is deliberately forgiving: case-insensitive, "w"/"watts" both OK,
+# "min"/"m"/"minutes" all map to 60s, etc. On failure we raise WorkoutParseError
+# with a message we can drop straight into the slot's status line.
+
+class WorkoutParseError(ValueError):
+    """Raised by `parse_trainer_command` when the text doesn't match any
+    supported pattern. The message is shown directly to the user."""
+
+
+_TIME_UNITS = {
+    "s": 1, "sec": 1, "secs": 1, "second": 1, "seconds": 1,
+    "m": 60, "min": 60, "mins": 60, "minute": 60, "minutes": 60,
+    "h": 3600, "hr": 3600, "hrs": 3600, "hour": 3600, "hours": 3600,
+}
+
+
+def _parse_duration(s: str) -> float:
+    """Parse '90sec', '2 min', '1.5 min', '1h30m', or bare '90' (seconds).
+
+    Composite forms like '1h30m' work because we sum *every* number+unit
+    pair found in the string. A bare number without a unit is interpreted
+    as seconds.
+    """
+    text = s.strip().lower()
+    if not text:
+        raise WorkoutParseError("missing duration")
+    pairs = re.findall(r"(\d+(?:\.\d+)?)\s*([a-z]*)", text)
+    if not pairs:
+        raise WorkoutParseError(f"can't read duration '{s}'")
+    total = 0.0
+    for value, unit in pairs:
+        if unit == "":
+            total += float(value)        # bare seconds
+        else:
+            mult = _TIME_UNITS.get(unit)
+            if mult is None:
+                raise WorkoutParseError(f"unknown time unit '{unit}'")
+            total += float(value) * mult
+    if total <= 0:
+        raise WorkoutParseError("duration must be positive")
+    return total
+
+
+def _format_duration(seconds: float) -> str:
+    """Inverse of `_parse_duration` for status messages. Picks the unit that
+    keeps the number short: seconds for under a minute, minutes otherwise."""
+    if seconds < 60:
+        return f"{int(round(seconds))}s"
+    minutes = seconds / 60
+    if abs(minutes - round(minutes)) < 1 / 60:
+        return f"{int(round(minutes))}min"
+    return f"{minutes:.1f}min"
+
+
+def _ramp_steps(start_w: int, end_w: int, total_s: float,
+                step_s: float = 5.0) -> list[tuple[int, float]]:
+    """Approximate a linear power ramp as a list of (watts, duration) steps.
+
+    FTMS doesn't have a native ramp opcode - the trainer just holds whatever
+    target we last set. So we slice the ramp into ~5-second increments and
+    fire Set Target Power at each tick. Five seconds is a sweet spot: short
+    enough that the watts feel continuous, long enough to avoid hammering
+    the BLE control point.
+    """
+    n = max(2, int(round(total_s / step_s)))
+    out = []
+    for i in range(n):
+        frac = i / (n - 1) if n > 1 else 1.0
+        watts = int(round(start_w + (end_w - start_w) * frac))
+        # Last slice absorbs the rounding remainder so the ramp lands
+        # exactly on `total_s`.
+        if i < n - 1:
+            out.append((watts, step_s))
+        else:
+            out.append((watts, max(0.1, total_s - step_s * (n - 1))))
+    return out
+
+
+def parse_trainer_command(text: str) -> dict:
+    """Turn user text into a `program` dict the scheduler can execute.
+
+    Return shapes:
+        {"type": "stop", "summary": str}
+        {"type": "set", "watts": int, "summary": str}
+        {"type": "nudge", "delta": int, "summary": str}
+        {"type": "program", "repeat": bool,
+         "steps": [(watts, duration_s), ...], "summary": str}
+    """
+    t = text.strip().lower()
+
+    if t in {"stop", "off", "pause", "halt", "end"}:
+        return {"type": "stop", "summary": "stop"}
+
+    # Relative nudge: "+25", "-50", optionally suffixed with w.
+    m = re.fullmatch(r"([+-]\d+)\s*w?", t)
+    if m:
+        delta = int(m.group(1))
+        return {"type": "nudge", "delta": delta,
+                "summary": f"adjust {delta:+d} W"}
+
+    # Alternate: "alternate between A and B [w] every <duration>"
+    m = re.fullmatch(
+        r"alternate\s+between\s+(\d+)\s*w?\s+(?:and|/)\s+(\d+)\s*w?\s+every\s+(.+)",
+        t,
+    )
+    if m:
+        a, b = int(m.group(1)), int(m.group(2))
+        d = _parse_duration(m.group(3))
+        return {
+            "type": "program", "repeat": True,
+            "steps": [(a, d), (b, d)],
+            "summary": f"alternate {a} W / {b} W every {_format_duration(d)} (looping)",
+        }
+
+    # Ramp: "ramp [from] A to B [w] (over|in) <duration>"
+    m = re.fullmatch(
+        r"ramp(?:\s+from)?\s+(\d+)\s*w?\s+to\s+(\d+)\s*w?\s+(?:over|in)\s+(.+)",
+        t,
+    )
+    if m:
+        a, b = int(m.group(1)), int(m.group(2))
+        total = _parse_duration(m.group(3))
+        steps = _ramp_steps(a, b, total)
+        return {
+            "type": "program", "repeat": False, "steps": steps,
+            "summary": f"ramp {a} -> {b} W over {_format_duration(total)}",
+        }
+
+    # Step sequence: "200w for 2min, 150w for 30sec[, repeat]" or with "then".
+    if " for " in t:
+        repeat = False
+        body = t
+        # `, repeat` or trailing `repeat` toggles looping.
+        repeat_pattern = re.compile(r"(?:,\s*|\s+(?:then\s+)?)repeat\s*$")
+        if repeat_pattern.search(body):
+            repeat = True
+            body = repeat_pattern.sub("", body).strip().rstrip(",").strip()
+        steps = []
+        for piece in re.split(r"\s*,\s*|\s+then\s+", body):
+            piece = piece.strip()
+            if not piece:
+                continue
+            mm = re.fullmatch(r"(\d+)\s*w?\s+for\s+(.+)", piece)
+            if not mm:
+                raise WorkoutParseError(
+                    f"can't read step '{piece}' (expected '<watts>w for <duration>')"
+                )
+            steps.append((int(mm.group(1)), _parse_duration(mm.group(2))))
+        if not steps:
+            raise WorkoutParseError("no steps found")
+        summary = " then ".join(
+            f"{w} W for {_format_duration(d)}" for w, d in steps
+        )
+        if repeat:
+            summary += " (looping)"
+        return {"type": "program", "repeat": repeat, "steps": steps,
+                "summary": summary}
+
+    # Bare set: "200" / "200w" / "200 watts"
+    m = re.fullmatch(r"(\d+)\s*(?:w|watt|watts)?", t)
+    if m:
+        watts = int(m.group(1))
+        return {"type": "set", "watts": watts, "summary": f"{watts} W"}
+
+    raise WorkoutParseError(
+        "Not understood. Try '200w', '+25', "
+        "'alternate between 150 and 200w every 1min', "
+        "'ramp from 150 to 250w over 5min', "
+        "'200w for 2min, 150w for 30sec, repeat', or 'stop'."
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -260,6 +517,71 @@ async def ble_meter_task(slot: MeterSlot, address: str, reading_queue: queue.Que
                 except Exception:
                     pass  # Non-fatal; user can still set it from the dialog.
 
+            # --- Smart trainer detection (FTMS) ---
+            # Many smart trainers expose both CPS *and* FTMS on the same BLE
+            # connection. If we find FTMS, claim control and prep the panel.
+            ftms_available = False
+            try:
+                services = client.services  # cached after async with __aenter__
+                has_ftms = any(
+                    s.uuid.lower() == FITNESS_MACHINE_SERVICE_UUID.lower()
+                    for s in services
+                )
+            except Exception:
+                has_ftms = False
+
+            if has_ftms:
+                try:
+                    await client.start_notify(
+                        FITNESS_MACHINE_CONTROL_POINT_UUID, _make_ftms_indicate(slot)
+                    )
+                    ftms_available = True
+                except Exception:
+                    ftms_available = False
+
+            if ftms_available:
+                # Read target-features (second 32-bit word of the FTMS Feature
+                # characteristic) so the UI can hide controls the trainer
+                # doesn't actually support.
+                try:
+                    feat = await client.read_gatt_char(FITNESS_MACHINE_FEATURE_UUID)
+                    if len(feat) >= 8:
+                        slot.ftms_target_features = int.from_bytes(feat[4:8], "little")
+                except Exception:
+                    slot.ftms_target_features = 0
+
+                # Optional: supported power range (min, max, step).
+                try:
+                    pr = await client.read_gatt_char(SUPPORTED_POWER_RANGE_UUID)
+                    if len(pr) >= 4:
+                        slot.ftms_power_min = int.from_bytes(pr[0:2], "little", signed=True)
+                        slot.ftms_power_max = int.from_bytes(pr[2:4], "little", signed=True)
+                except Exception:
+                    pass
+
+                try:
+                    rr = await client.read_gatt_char(SUPPORTED_RESISTANCE_RANGE_UUID)
+                    if len(rr) >= 4:
+                        slot.ftms_resistance_min = int.from_bytes(rr[0:2], "little", signed=True) / 10.0
+                        slot.ftms_resistance_max = int.from_bytes(rr[2:4], "little", signed=True) / 10.0
+                except Exception:
+                    pass
+
+                # Request control. Most trainers need this once per session
+                # before they'll honour Set Target Power et al. Failure here
+                # isn't fatal - we still show the UI and surface errors when
+                # the user tries to use it.
+                try:
+                    await ftms_control_point_request(
+                        slot, FTMS_OP_REQUEST_CONTROL, b"", timeout=3.0
+                    )
+                except Exception:
+                    pass
+
+                slot.ftms_available = True
+                # Tell the GUI to reveal the trainer panel for this slot.
+                reading_queue.put(("FTMS_READY", slot.slot_id))
+
             # Idle here until we're asked to stop. The canceller task above
             # will cancel us as soon as stop_event flips, so a long sleep
             # here is fine and slightly cheaper than the old 200ms poll.
@@ -275,6 +597,19 @@ async def ble_meter_task(slot: MeterSlot, address: str, reading_queue: queue.Que
                     await client.stop_notify(CYCLING_POWER_CONTROL_POINT_UUID)
                 except Exception:
                     pass
+            if ftms_available:
+                # Release control / stop ERG so the trainer doesn't keep
+                # holding the last commanded target after we walk away.
+                try:
+                    await ftms_control_point_request(
+                        slot, FTMS_OP_RESET, b"", timeout=2.0
+                    )
+                except Exception:
+                    pass
+                try:
+                    await client.stop_notify(FITNESS_MACHINE_CONTROL_POINT_UUID)
+                except Exception:
+                    pass
     except asyncio.CancelledError:
         # User-initiated cancel via stop_event. Treat as a clean disconnect,
         # not an error - no popup needed.
@@ -287,6 +622,12 @@ async def ble_meter_task(slot: MeterSlot, address: str, reading_queue: queue.Que
         slot.connected = False
         slot.ble_client = None
         slot.ble_cp_responses = {}
+        slot.ftms_available = False
+        slot.ftms_responses = {}
+        slot.ftms_target_features = 0
+        slot.ftms_power_min = slot.ftms_power_max = None
+        slot.ftms_resistance_min = slot.ftms_resistance_max = None
+        slot.ftms_target_power_w = None
         reading_queue.put(("DISCONNECTED", slot.slot_id))
 
 
@@ -345,6 +686,88 @@ async def ble_read_crank_length(slot: MeterSlot):
         length = int.from_bytes(payload[:2], "little") / 2.0
         slot.crank_length_mm = length
     return rc, length
+
+
+def _make_ftms_indicate(slot: MeterSlot):
+    """Build the FTMS Control Point indication handler for this slot.
+
+    Each response indication starts with 0x80 (response code), followed by the
+    request opcode, the result code, and op-specific payload bytes. We resolve
+    the per-opcode Future stashed on the slot so the awaiting coroutine wakes
+    up with the parsed result.
+    """
+    def on_indicate(_char, data: bytearray):
+        if len(data) < 3 or data[0] != FTMS_OP_RESPONSE_CODE:
+            return
+        request_opcode = data[1]
+        result_code = data[2]
+        payload = bytes(data[3:])
+        fut = slot.ftms_responses.pop(request_opcode, None)
+        if fut is not None and not fut.done():
+            fut.set_result((result_code, payload))
+    return on_indicate
+
+
+async def ftms_control_point_request(slot: MeterSlot, opcode: int,
+                                     payload: bytes = b"", timeout: float = 5.0):
+    """Send an FTMS Control Point request and await the response indication.
+
+    Mirrors `ble_control_point_request` but uses the FTMS response map and
+    UUID. Must run on the same asyncio loop that owns `slot.ble_client`.
+    """
+    client = slot.ble_client
+    if client is None:
+        raise RuntimeError("BLE client not connected.")
+    loop = asyncio.get_event_loop()
+    fut = loop.create_future()
+    slot.ftms_responses[opcode] = fut
+    frame = bytes([opcode]) + payload
+
+    async def _round_trip():
+        await client.write_gatt_char(FITNESS_MACHINE_CONTROL_POINT_UUID, frame, response=True)
+        return await fut
+
+    try:
+        return await asyncio.wait_for(_round_trip(), timeout=timeout)
+    finally:
+        slot.ftms_responses.pop(opcode, None)
+
+
+async def ftms_set_target_power(slot: MeterSlot, watts: int):
+    """ERG mode: hold the rider at `watts` regardless of cadence/gear.
+
+    Watts is encoded as a signed int16 little-endian. Negative values are
+    legal in spec but most trainers reject them - we clamp to >= 0.
+    """
+    watts = max(-32768, min(32767, int(watts)))
+    payload = watts.to_bytes(2, "little", signed=True)
+    rc, _ = await ftms_control_point_request(slot, FTMS_OP_SET_TARGET_POWER, payload)
+    if rc == FTMS_RESULT_SUCCESS:
+        slot.ftms_target_power_w = watts
+    return rc
+
+
+async def ftms_set_target_resistance(slot: MeterSlot, level: float):
+    """Set raw resistance level (units of 0.1, signed 16-bit)."""
+    encoded = int(round(level * 10))
+    encoded = max(-32768, min(32767, encoded))
+    payload = encoded.to_bytes(2, "little", signed=True)
+    rc, _ = await ftms_control_point_request(slot, FTMS_OP_SET_TARGET_RESISTANCE, payload)
+    return rc
+
+
+async def ftms_stop(slot: MeterSlot):
+    """Stop/Pause: tells the trainer to drop ERG and let the rider freewheel."""
+    payload = bytes([0x01])  # 0x01 = Stop, 0x02 = Pause; we want a hard stop.
+    rc, _ = await ftms_control_point_request(slot, FTMS_OP_STOP_PAUSE, payload)
+    if rc == FTMS_RESULT_SUCCESS:
+        slot.ftms_target_power_w = None
+    return rc
+
+
+async def ftms_request_control(slot: MeterSlot):
+    rc, _ = await ftms_control_point_request(slot, FTMS_OP_REQUEST_CONTROL, b"")
+    return rc
 
 
 async def ble_zero_offset(slot: MeterSlot, timeout: float = 15.0):
@@ -715,7 +1138,10 @@ class CalibrationDialog(tk.Toplevel):
         super().__init__(app.root)
         self.app = app
         self.slot_id = slot_id
-        self.slot = app.slots[slot_id - 1]
+        self.slot = app._slot(slot_id)
+        if self.slot is None:
+            self.destroy()
+            return
         self.title(f"Calibrate Meter {slot_id}")
         self.geometry("440x460")
         # Non-modal: live readings stay visible behind the dialog.
@@ -895,7 +1321,14 @@ class CalibrationDialog(tk.Toplevel):
         if "operation failed" in m:
             return " - keep pedals/crank stationary, then retry."
         if "not supported" in m:
-            return " - meter does not advertise this operation."
+            # Common on Garmin Vector/Rally and a handful of older meters:
+            # they implement calibration only over ANT+, even when the BLE
+            # CP control point is exposed. Steer the user that way rather
+            # than leaving them stuck thinking the pedals are broken.
+            return (" - meter rejects this over BLE. Many Garmin pedals "
+                    "(Vector / Rally) and similar dual-protocol meters "
+                    "expose calibration only on ANT+. Re-pair this slot as "
+                    "ANT+ and retry.")
         return ""
 
     def _set_status(self, text: str, color: str = "gray"):
@@ -910,14 +1343,15 @@ class CalibrationDialog(tk.Toplevel):
 class PowerMeterApp:
     """The Tkinter GUI. Owns the slots, the recording state, and the queue."""
 
-    NUM_SLOTS = 3
+    INITIAL_SLOTS = 2        # How many empty slots to start with on launch
     POLL_INTERVAL_MS = 100   # How often we drain the queue and refresh UI
     STALE_AFTER_SEC = 3.0    # If no reading for this long, show power as 0
+    SLOT_PANEL_WIDTH = 280   # Fixed slot-panel width so horizontal scroll works
 
     def __init__(self, root: tk.Tk):
         self.root = root
         self.root.title("Multi Power Meter")
-        self.root.geometry("780x520")
+        self.root.geometry("980x640")
 
         # Thread-safe queue: workers push readings, GUI pops them.
         self.reading_queue: queue.Queue = queue.Queue()
@@ -925,8 +1359,18 @@ class PowerMeterApp:
         # Background asyncio loop for BLE.
         self.async_thread = AsyncLoopThread() if BLEAK_AVAILABLE else None
 
-        # State for each of the three slots.
-        self.slots = [MeterSlot(slot_id=i + 1) for i in range(self.NUM_SLOTS)]
+        # Slots are stored in display order; widgets are keyed by slot_id so
+        # adding/removing a slot in the middle doesn't shift the lookups.
+        # Slot IDs are monotonic and never reused - this means a stray queue
+        # item from a removed slot is silently dropped instead of polluting
+        # whatever happens to be in that ordinal position now.
+        self.slots: list[MeterSlot] = []
+        self.slot_widgets: dict[int, dict] = {}
+        self._next_slot_id = 1
+
+        # Active text-driven workout schedules, keyed by slot_id. Each value
+        # is the `after()` job id we'd cancel if the user replaces or stops it.
+        self._schedules: dict[int, dict] = {}
 
         # Recording state.
         self.recording = False
@@ -940,11 +1384,23 @@ class PowerMeterApp:
 
         self._build_ui()
 
+        # Spin up a couple of empty slots so the UI isn't blank on first run.
+        for _ in range(self.INITIAL_SLOTS):
+            self._add_meter()
+
         # Kick off the periodic queue-draining loop.
         self.root.after(self.POLL_INTERVAL_MS, self._poll_queue)
 
         # Make sure we shut down workers cleanly on window close.
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+
+    # -- Slot lookup helpers -------------------------------------------------
+
+    def _slot(self, slot_id: int) -> Optional[MeterSlot]:
+        return next((s for s in self.slots if s.slot_id == slot_id), None)
+
+    def _widgets(self, slot_id: int) -> Optional[dict]:
+        return self.slot_widgets.get(slot_id)
 
     # -- UI construction -----------------------------------------------------
 
@@ -955,15 +1411,49 @@ class PowerMeterApp:
         status.append("ANT+: " + ("ready" if OPENANT_AVAILABLE else "MISSING (pip install openant)"))
         ttk.Label(self.root, text="  |  ".join(status), foreground="gray").pack(pady=(8, 0))
 
-        # Container for the three slot panels.
-        slots_frame = ttk.Frame(self.root)
-        slots_frame.pack(fill="both", expand=True, padx=10, pady=10)
+        # Toolbar: add/remove meters.
+        toolbar = ttk.Frame(self.root)
+        toolbar.pack(fill="x", padx=10, pady=(8, 0))
+        ttk.Button(toolbar, text="+ Add meter", command=self._add_meter).pack(side="left")
+        ttk.Label(
+            toolbar,
+            text="Tip: a smart trainer's controls appear inline once it connects.",
+            foreground="gray",
+        ).pack(side="left", padx=10)
 
-        self.slot_widgets = []
-        for i in range(self.NUM_SLOTS):
-            sw = self._build_slot_panel(slots_frame, i + 1)
-            sw["frame"].pack(side="left", fill="both", expand=True, padx=5)
-            self.slot_widgets.append(sw)
+        # Scrollable container: a Canvas hosts an inner frame that holds the
+        # slot panels. Horizontal scrolling means we can fit an unbounded
+        # number of slots without forcing the user's window to grow.
+        outer = ttk.Frame(self.root)
+        outer.pack(fill="both", expand=True, padx=10, pady=10)
+        self.slots_canvas = tk.Canvas(outer, highlightthickness=0)
+        hbar = ttk.Scrollbar(outer, orient="horizontal",
+                             command=self.slots_canvas.xview)
+        self.slots_canvas.configure(xscrollcommand=hbar.set)
+        self.slots_canvas.pack(side="top", fill="both", expand=True)
+        hbar.pack(side="bottom", fill="x")
+
+        self.slots_inner = ttk.Frame(self.slots_canvas)
+        self._slots_window = self.slots_canvas.create_window(
+            (0, 0), window=self.slots_inner, anchor="nw"
+        )
+        # Update scrollregion whenever the inner frame resizes (e.g. a slot
+        # got added or a trainer panel expanded).
+        def _on_inner_configure(_e):
+            self.slots_canvas.configure(scrollregion=self.slots_canvas.bbox("all"))
+        self.slots_inner.bind("<Configure>", _on_inner_configure)
+        # Match the inner frame's height to the canvas so panels can fill
+        # vertically without leaving dead space below.
+        def _on_canvas_configure(e):
+            self.slots_canvas.itemconfigure(self._slots_window, height=e.height)
+        self.slots_canvas.bind("<Configure>", _on_canvas_configure)
+        # Mouse wheel = horizontal scroll while hovered over the slots area.
+        def _on_wheel(e):
+            self.slots_canvas.xview_scroll(int(-e.delta / 120), "units")
+        self.slots_canvas.bind("<Enter>",
+            lambda _e: self.slots_canvas.bind_all("<MouseWheel>", _on_wheel))
+        self.slots_canvas.bind("<Leave>",
+            lambda _e: self.slots_canvas.unbind_all("<MouseWheel>"))
 
         # Bottom: comparison + recording controls.
         bottom = ttk.Frame(self.root)
@@ -987,13 +1477,26 @@ class PowerMeterApp:
         self.record_status.pack(side="right", padx=10)
 
     def _build_slot_panel(self, parent, slot_id: int) -> dict:
-        """Build the per-slot UI: protocol picker, scan/connect, big power readout."""
+        """Build the per-slot UI: protocol picker, scan/connect, big power
+        readout, plus an inline trainer-control panel that's hidden until
+        the BLE worker reports the device exposes the Fitness Machine Service.
+        """
         frame = ttk.LabelFrame(parent, text=f"Meter {slot_id}", padding=8)
+        # Fixed width so panels lay out predictably under horizontal scroll.
+        frame.configure(width=self.SLOT_PANEL_WIDTH)
+        frame.pack_propagate(False)
+
+        # Header: remove button on the right.
+        header = ttk.Frame(frame)
+        header.pack(fill="x")
+        remove_btn = ttk.Button(header, text="Remove", width=8,
+                                command=lambda s=slot_id: self._remove_meter(s))
+        remove_btn.pack(side="right")
 
         # Protocol selector (BLE vs ANT+).
         proto_var = tk.StringVar(value="BLE")
         proto_frame = ttk.Frame(frame)
-        proto_frame.pack(fill="x")
+        proto_frame.pack(fill="x", pady=(4, 0))
         ttk.Label(proto_frame, text="Protocol:").pack(side="left")
         ttk.Radiobutton(proto_frame, text="BLE", variable=proto_var,
                         value="BLE").pack(side="left")
@@ -1044,8 +1547,74 @@ class PowerMeterApp:
         status_label = ttk.Label(frame, textvariable=status_var, foreground="gray")
         status_label.pack(pady=(8, 0))
 
+        # ---- Trainer control panel (hidden until FTMS detected) ----
+        # Built up-front so the worker thread doesn't have to construct widgets
+        # from a non-Tk thread; we just `pack` it when FTMS becomes available.
+        trainer_frame = ttk.LabelFrame(frame, text="Trainer (ERG)", padding=6)
+        trainer_target_var = tk.StringVar(value="")
+        trainer_actual_var = tk.StringVar(value="target: —")
+        ttk.Label(trainer_frame, textvariable=trainer_actual_var,
+                  foreground="gray").pack(anchor="w")
+
+        # Quick-set row: numeric entry + +/- nudges + Set/Stop.
+        quick = ttk.Frame(trainer_frame)
+        quick.pack(fill="x", pady=(4, 0))
+        ttk.Label(quick, text="W:").pack(side="left")
+        target_entry = ttk.Entry(quick, textvariable=trainer_target_var, width=6)
+        target_entry.pack(side="left", padx=(2, 4))
+        target_entry.bind(
+            "<Return>",
+            lambda _e, s=slot_id: self._trainer_set_from_entry(s),
+        )
+        ttk.Button(quick, text="Set", width=4,
+                   command=lambda s=slot_id: self._trainer_set_from_entry(s)
+                   ).pack(side="left")
+        ttk.Button(quick, text="-25", width=4,
+                   command=lambda s=slot_id: self._trainer_nudge(s, -25)
+                   ).pack(side="left", padx=(4, 0))
+        ttk.Button(quick, text="+25", width=4,
+                   command=lambda s=slot_id: self._trainer_nudge(s, +25)
+                   ).pack(side="left", padx=(2, 0))
+        ttk.Button(quick, text="Stop", width=5,
+                   command=lambda s=slot_id: self._trainer_stop(s)
+                   ).pack(side="left", padx=(6, 0))
+
+        # Plain-text workout entry. Examples (placeholder text):
+        #   200w
+        #   alternate between 150 and 200w every 1min
+        #   ramp 150 to 250w over 10min
+        #   200w 2min, 150w 30sec, repeat
+        ttk.Label(trainer_frame, text="Workout (plain text):").pack(
+            anchor="w", pady=(8, 0)
+        )
+        cmd_var = tk.StringVar(value="")
+        cmd_entry = ttk.Entry(trainer_frame, textvariable=cmd_var)
+        cmd_entry.pack(fill="x")
+        cmd_entry.bind(
+            "<Return>",
+            lambda _e, s=slot_id: self._trainer_run_command(s),
+        )
+
+        cmd_btn_row = ttk.Frame(trainer_frame)
+        cmd_btn_row.pack(fill="x", pady=(4, 0))
+        ttk.Button(cmd_btn_row, text="Run",
+                   command=lambda s=slot_id: self._trainer_run_command(s)
+                   ).pack(side="left")
+        ttk.Button(cmd_btn_row, text="Cancel workout",
+                   command=lambda s=slot_id: self._trainer_cancel_schedule(s)
+                   ).pack(side="left", padx=4)
+
+        cmd_status_var = tk.StringVar(value="")
+        cmd_status_label = ttk.Label(
+            trainer_frame, textvariable=cmd_status_var,
+            foreground="gray", wraplength=self.SLOT_PANEL_WIDTH - 30,
+            justify="left",
+        )
+        cmd_status_label.pack(anchor="w", pady=(4, 0))
+
         return {
             "frame": frame,
+            "remove_btn": remove_btn,
             "proto_var": proto_var,
             "device_var": device_var,
             "device_combo": device_combo,
@@ -1063,6 +1632,15 @@ class PowerMeterApp:
             # Cache of (name, address) tuples from the most recent scan -
             # the combobox shows names, but we need addresses to connect.
             "scan_results": [],
+            # Trainer panel widgets and state (panel itself stays unpacked
+            # until the BLE worker confirms FTMS is supported).
+            "trainer_frame": trainer_frame,
+            "trainer_target_var": trainer_target_var,
+            "trainer_actual_var": trainer_actual_var,
+            "trainer_visible": False,
+            "cmd_var": cmd_var,
+            "cmd_status_var": cmd_status_var,
+            "cmd_status_label": cmd_status_label,
         }
 
     # -- Scanning ------------------------------------------------------------
@@ -1073,7 +1651,9 @@ class PowerMeterApp:
             messagebox.showerror("BLE not available",
                                  "Install bleak: pip install bleak")
             return
-        sw = self.slot_widgets[slot_id - 1]
+        sw = self._widgets(slot_id)
+        if sw is None:
+            return
         sw["scan_btn"].config(state="disabled", text="Scanning...")
 
         # Submit the coroutine to the background loop. When it completes,
@@ -1092,7 +1672,9 @@ class PowerMeterApp:
 
     def _scan_finished(self, slot_id: int, results: list):
         """Populate the dropdown with scan results."""
-        sw = self.slot_widgets[slot_id - 1]
+        sw = self._widgets(slot_id)
+        if sw is None:
+            return  # Slot was removed before the scan came back.
         sw["scan_btn"].config(state="normal", text="Scan")
         sw["scan_results"] = results
         # Combobox values are display strings; we look up the address by
@@ -1107,8 +1689,10 @@ class PowerMeterApp:
     # -- Connect / disconnect ------------------------------------------------
 
     def _connect(self, slot_id: int):
-        sw = self.slot_widgets[slot_id - 1]
-        slot = self.slots[slot_id - 1]
+        sw = self._widgets(slot_id)
+        slot = self._slot(slot_id)
+        if sw is None or slot is None:
+            return
 
         if slot.connected:
             return
@@ -1193,7 +1777,12 @@ class PowerMeterApp:
         return ""
 
     def _disconnect(self, slot_id: int):
-        slot = self.slots[slot_id - 1]
+        slot = self._slot(slot_id)
+        if slot is None:
+            return
+        # Cancel any active text-driven workout schedule alongside the
+        # underlying connection so the trainer doesn't keep getting commands.
+        self._trainer_cancel_schedule(slot_id, silent=True)
         if slot.stop_event is not None:
             slot.stop_event.set()
         # The worker will push a DISCONNECTED message to the queue when done,
@@ -1216,12 +1805,14 @@ class PowerMeterApp:
     def _handle_queue_item(self, item):
         # Workers push either a PowerReading or a (tag, ...) tuple for events.
         if isinstance(item, PowerReading):
-            slot = self.slots[item.slot - 1]
+            slot = self._slot(item.slot)
+            sw = self._widgets(item.slot)
+            if slot is None or sw is None:
+                return  # Reading from a removed slot - drop silently.
             slot.latest_power = item.power_watts
             slot.latest_cadence = item.cadence_rpm
             slot.last_update = item.timestamp
             slot.connected = True
-            sw = self.slot_widgets[item.slot - 1]
             # First reading? Allow the user to open the calibration dialog.
             if str(sw["calibrate_btn"]["state"]) == "disabled":
                 sw["calibrate_btn"].config(state="normal")
@@ -1233,11 +1824,18 @@ class PowerMeterApp:
             tag = item[0]
             if tag == "DISCONNECTED":
                 slot_id = item[1]
-                self.slots[slot_id - 1].connected = False
-                sw = self.slot_widgets[slot_id - 1]
+                slot = self._slot(slot_id)
+                sw = self._widgets(slot_id)
+                if slot is None or sw is None:
+                    return
+                slot.connected = False
                 sw["connect_btn"].config(state="normal")
                 sw["disconnect_btn"].config(state="disabled")
                 sw["calibrate_btn"].config(state="disabled")
+                # Hide trainer panel and cancel any running workout: the
+                # connection is gone so commands would just error out.
+                self._trainer_cancel_schedule(slot_id, silent=True)
+                self._hide_trainer_panel(slot_id)
                 # If an ERROR preceded this DISCONNECTED, preserve the red
                 # error indicator so the user can still see what went wrong
                 # after dismissing the messagebox. Cleared on next connect.
@@ -1246,7 +1844,9 @@ class PowerMeterApp:
                     sw["status_label"].config(foreground="gray")
             elif tag == "ERROR":
                 slot_id, msg = item[1], item[2]
-                sw = self.slot_widgets[slot_id - 1]
+                sw = self._widgets(slot_id)
+                if sw is None:
+                    return
                 sw["had_error"] = True
                 sw["status_var"].set(f"● error")
                 sw["status_label"].config(foreground="red")
@@ -1255,14 +1855,21 @@ class PowerMeterApp:
                 # a hobbyist app; busy users can comment out the messagebox.)
                 print(f"[Slot {slot_id}] {msg}")
                 messagebox.showerror(f"Meter {slot_id} error", msg)
+            elif tag == "FTMS_READY":
+                # Worker found a Fitness Machine Service on this connection -
+                # reveal the trainer-control panel inside its frame.
+                slot_id = item[1]
+                self._show_trainer_panel(slot_id)
 
     def _refresh_displays(self):
         """Update each slot's power/cadence labels and the comparison footer."""
         now = time.time()
         live_powers = []
 
-        for i, slot in enumerate(self.slots):
-            sw = self.slot_widgets[i]
+        for slot in self.slots:
+            sw = self.slot_widgets.get(slot.slot_id)
+            if sw is None:
+                continue
             stale = (now - slot.last_update) > self.STALE_AFTER_SEC
 
             if slot.connected and not stale:
@@ -1297,7 +1904,9 @@ class PowerMeterApp:
     # -- Calibration plumbing -----------------------------------------------
 
     def _open_calibration(self, slot_id: int):
-        slot = self.slots[slot_id - 1]
+        slot = self._slot(slot_id)
+        if slot is None:
+            return
         if not slot.connected:
             messagebox.showinfo("Not connected",
                                 f"Connect Meter {slot_id} before calibrating.")
@@ -1321,7 +1930,10 @@ class PowerMeterApp:
         thread. Includes a guard timer so the dialog can't hang forever if
         the worker dies mid-request.
         """
-        slot = self.slots[slot_id - 1]
+        slot = self._slot(slot_id)
+        if slot is None:
+            on_done({"ok": False, "msg": "Slot no longer exists"})
+            return
         state = {"done": False}
         timeout_ms = 20000 if op == "zero_offset" else 8000
 
@@ -1401,6 +2013,282 @@ class PowerMeterApp:
                 slot.ant_command_queue.put(
                     lambda: antplus_zero_offset(slot, gui_complete)
                 )
+
+    # -- Adding / removing meters -------------------------------------------
+
+    def _add_meter(self):
+        """Append a new empty slot to the right end of the panel row."""
+        slot_id = self._next_slot_id
+        self._next_slot_id += 1
+        slot = MeterSlot(slot_id=slot_id)
+        self.slots.append(slot)
+        sw = self._build_slot_panel(self.slots_inner, slot_id)
+        sw["frame"].pack(side="left", fill="y", padx=5, pady=2)
+        self.slot_widgets[slot_id] = sw
+        # Force the canvas to recalc scrollregion for the new panel.
+        self.slots_inner.update_idletasks()
+        self.slots_canvas.configure(scrollregion=self.slots_canvas.bbox("all"))
+        # Scroll to the right edge so the new slot is visible.
+        self.slots_canvas.xview_moveto(1.0)
+
+    def _remove_meter(self, slot_id: int):
+        """Remove a slot. Refuses while a connection is live - the user
+        should disconnect first so the worker can shut down cleanly."""
+        slot = self._slot(slot_id)
+        sw = self._widgets(slot_id)
+        if slot is None or sw is None:
+            return
+        if slot.connected or slot.stop_event is not None:
+            messagebox.showinfo(
+                "Disconnect first",
+                f"Meter {slot_id} is still connected. Hit Disconnect first.",
+            )
+            return
+        self._trainer_cancel_schedule(slot_id, silent=True)
+        sw["frame"].destroy()
+        self.slots = [s for s in self.slots if s.slot_id != slot_id]
+        self.slot_widgets.pop(slot_id, None)
+        self.slots_inner.update_idletasks()
+        self.slots_canvas.configure(scrollregion=self.slots_canvas.bbox("all"))
+
+    # -- Trainer panel show/hide --------------------------------------------
+
+    def _show_trainer_panel(self, slot_id: int):
+        sw = self._widgets(slot_id)
+        slot = self._slot(slot_id)
+        if sw is None or slot is None:
+            return
+        if not sw["trainer_visible"]:
+            sw["trainer_frame"].pack(fill="x", pady=(8, 0))
+            sw["trainer_visible"] = True
+        # Show the supported power range as the panel's subtitle.
+        if slot.ftms_power_min is not None and slot.ftms_power_max is not None:
+            sw["trainer_actual_var"].set(
+                f"target: — (range {slot.ftms_power_min}-{slot.ftms_power_max} W)"
+            )
+        else:
+            sw["trainer_actual_var"].set("target: —")
+        sw["cmd_status_var"].set("")
+
+    def _hide_trainer_panel(self, slot_id: int):
+        sw = self._widgets(slot_id)
+        if sw is None:
+            return
+        if sw["trainer_visible"]:
+            sw["trainer_frame"].forget()
+            sw["trainer_visible"] = False
+        sw["trainer_target_var"].set("")
+        sw["trainer_actual_var"].set("target: —")
+        sw["cmd_status_var"].set("")
+
+    # -- Trainer single-shot commands ---------------------------------------
+
+    def _trainer_set_from_entry(self, slot_id: int):
+        sw = self._widgets(slot_id)
+        if sw is None:
+            return
+        try:
+            watts = int(float(sw["trainer_target_var"].get()))
+        except ValueError:
+            sw["cmd_status_var"].set("Enter a number for watts.")
+            return
+        # Setting from the quick-set entry stops any active workout - it's
+        # what the user just chose, so it's the new ground truth.
+        self._trainer_cancel_schedule(slot_id, silent=True)
+        self._trainer_set_target(slot_id, watts, source="manual")
+
+    def _trainer_nudge(self, slot_id: int, delta: int):
+        slot = self._slot(slot_id)
+        sw = self._widgets(slot_id)
+        if slot is None or sw is None:
+            return
+        # Base the nudge on the last commanded target if we have one,
+        # otherwise off the current entry value, otherwise off live power.
+        base = slot.ftms_target_power_w
+        if base is None:
+            try:
+                base = int(float(sw["trainer_target_var"].get()))
+            except (ValueError, TypeError):
+                base = slot.latest_power
+        new_w = max(0, base + delta)
+        self._trainer_cancel_schedule(slot_id, silent=True)
+        self._trainer_set_target(slot_id, new_w, source="manual")
+
+    def _trainer_stop(self, slot_id: int):
+        self._trainer_cancel_schedule(slot_id, silent=True)
+        slot = self._slot(slot_id)
+        if slot is None or not slot.ftms_available or self.async_thread is None:
+            return
+        future = self.async_thread.submit(ftms_stop(slot))
+
+        def on_done(fut):
+            try:
+                rc = fut.result()
+            except Exception as e:
+                self.root.after(0,
+                    lambda: self._trainer_status(slot_id, f"Stop failed: {e}", "red"))
+                return
+            self.root.after(0, lambda: self._on_trainer_response(slot_id, rc, "Stopped"))
+
+        future.add_done_callback(on_done)
+
+    def _trainer_set_target(self, slot_id: int, watts: int, source: str = "manual"):
+        """Send Set Target Power. `source` controls the status line wording
+        (so the user can tell apart manual entries from workout steps)."""
+        slot = self._slot(slot_id)
+        sw = self._widgets(slot_id)
+        if slot is None or sw is None:
+            return
+        if not slot.ftms_available or slot.ble_client is None or self.async_thread is None:
+            self._trainer_status(slot_id, "Trainer not connected.", "red")
+            return
+        if slot.ftms_power_min is not None and watts < slot.ftms_power_min and watts > 0:
+            watts = max(watts, slot.ftms_power_min)
+        if slot.ftms_power_max is not None and watts > slot.ftms_power_max:
+            watts = slot.ftms_power_max
+        sw["trainer_target_var"].set(str(watts))
+        sw["trainer_actual_var"].set(f"target: {watts} W")
+        future = self.async_thread.submit(ftms_set_target_power(slot, watts))
+
+        def on_done(fut):
+            try:
+                rc = fut.result()
+            except Exception as e:
+                self.root.after(0,
+                    lambda: self._trainer_status(slot_id, f"Send failed: {e}", "red"))
+                return
+            label = ("Set" if source == "manual" else "Workout") + f" -> {watts} W"
+            self.root.after(0, lambda: self._on_trainer_response(slot_id, rc, label))
+
+        future.add_done_callback(on_done)
+
+    def _on_trainer_response(self, slot_id: int, rc: int, label: str):
+        if rc == FTMS_RESULT_SUCCESS:
+            self._trainer_status(slot_id, f"OK: {label}", "green")
+            return
+        # If the trainer says control isn't permitted, try to grab control
+        # once and replay nothing - the user can hit Set again. Some trainers
+        # silently lose control after a long idle.
+        if rc == FTMS_RESULT_CONTROL_NOT_PERMITTED:
+            slot = self._slot(slot_id)
+            if slot is not None and self.async_thread is not None:
+                self.async_thread.submit(ftms_request_control(slot))
+            self._trainer_status(
+                slot_id,
+                f"{label}: control was not permitted - re-requested. Try again.",
+                "orange",
+            )
+            return
+        msg = FTMS_RESULT_NAMES.get(rc, f"code {rc:#x}")
+        self._trainer_status(slot_id, f"{label}: {msg}", "red")
+
+    def _trainer_status(self, slot_id: int, text: str, color: str = "gray"):
+        sw = self._widgets(slot_id)
+        if sw is None:
+            return
+        sw["cmd_status_var"].set(text)
+        sw["cmd_status_label"].configure(foreground=color)
+
+    # -- Plain-text workout parser + scheduler ------------------------------
+
+    def _trainer_run_command(self, slot_id: int):
+        """Parse and execute the text in the slot's command entry."""
+        sw = self._widgets(slot_id)
+        slot = self._slot(slot_id)
+        if sw is None or slot is None:
+            return
+        text = sw["cmd_var"].get().strip()
+        if not text:
+            return
+        if not slot.ftms_available:
+            self._trainer_status(slot_id, "Trainer not connected.", "red")
+            return
+        try:
+            program = parse_trainer_command(text)
+        except WorkoutParseError as e:
+            self._trainer_status(slot_id, f"Parse error: {e}", "red")
+            return
+        # Cancel anything previously running, then either set once or run a
+        # step program. Always show what we understood so the user can sanity-
+        # check that "alternate between 150 and 200w every 1min" parsed right.
+        self._trainer_cancel_schedule(slot_id, silent=True)
+        if program["type"] == "stop":
+            self._trainer_stop(slot_id)
+            self._trainer_status(slot_id, "Stopped (user).", "gray")
+            return
+        if program["type"] == "set":
+            self._trainer_set_target(slot_id, program["watts"], source="manual")
+            return
+        if program["type"] == "nudge":
+            self._trainer_nudge(slot_id, program["delta"])
+            return
+        # Multi-step: store the program and start at step 0.
+        self._schedules[slot_id] = {
+            "program": program,
+            "step_idx": 0,
+            "after_id": None,
+            "summary": program["summary"],
+            "step_started": time.time(),
+        }
+        self._trainer_status(
+            slot_id, f"Workout: {program['summary']}", "blue",
+        )
+        self._trainer_run_step(slot_id)
+
+    def _trainer_run_step(self, slot_id: int):
+        """Execute the current step of the slot's workout, then schedule
+        the next one with `root.after`. Re-entrant via after()."""
+        sched = self._schedules.get(slot_id)
+        slot = self._slot(slot_id)
+        if sched is None or slot is None:
+            return
+        if not slot.ftms_available:
+            # Trainer disappeared between steps. Bail and tell the user.
+            self._trainer_cancel_schedule(slot_id, silent=False)
+            return
+        steps = sched["program"]["steps"]
+        idx = sched["step_idx"]
+        # Programs marked `repeat=True` loop back to step 0 forever; otherwise
+        # we stop after running through the list once.
+        if idx >= len(steps):
+            if sched["program"].get("repeat"):
+                idx = 0
+                sched["step_idx"] = 0
+            else:
+                self._trainer_status(slot_id, "Workout complete.", "green")
+                self._schedules.pop(slot_id, None)
+                return
+        watts, duration_s = steps[idx]
+        sched["step_started"] = time.time()
+        self._trainer_set_target(slot_id, watts, source="workout")
+        sw = self._widgets(slot_id)
+        if sw is not None:
+            sw["cmd_status_var"].set(
+                f"Workout step {idx + 1}/{len(steps)}: {watts} W "
+                f"for {_format_duration(duration_s)}"
+            )
+        # Schedule the next step. `after_id` lets us cancel mid-step.
+        sched["step_idx"] = idx + 1
+        sched["after_id"] = self.root.after(
+            int(duration_s * 1000),
+            lambda: self._trainer_run_step(slot_id),
+        )
+
+    def _trainer_cancel_schedule(self, slot_id: int, silent: bool = False):
+        """Cancel any active text-driven workout for this slot. Doesn't stop
+        ERG mode itself - the trainer keeps holding the last commanded target
+        until the user presses Stop or sets a new one."""
+        sched = self._schedules.pop(slot_id, None)
+        if sched is None:
+            return
+        after_id = sched.get("after_id")
+        if after_id is not None:
+            try:
+                self.root.after_cancel(after_id)
+            except Exception:
+                pass
+        if not silent:
+            self._trainer_status(slot_id, "Workout cancelled.", "gray")
 
     @staticmethod
     def _meter_config_key(slot: MeterSlot) -> str:
@@ -1491,7 +2379,9 @@ class PowerMeterApp:
         self.recording_file.flush()
 
     def _write_recording_row(self, reading: PowerReading):
-        slot = self.slots[reading.slot - 1]
+        slot = self._slot(reading.slot)
+        if slot is None:
+            return
         elapsed = reading.timestamp - (self.recording_start_time or reading.timestamp)
         self.csv_writer.writerow([
             datetime.fromtimestamp(reading.timestamp).isoformat(timespec="milliseconds"),
