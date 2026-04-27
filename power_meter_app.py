@@ -245,6 +245,7 @@ class MeterSlot:
     latest_power: int = 0           # Most recent power reading (watts)
     latest_cadence: Optional[float] = None
     last_update: float = 0.0        # Unix time of last reading
+    connect_started: float = 0.0    # Unix time when this slot's worker was spun up
     # The thread/task that owns this connection, so we can cancel it cleanly.
     worker: Optional[object] = field(default=None, repr=False)
     # An event used to ask the worker to stop.
@@ -951,6 +952,19 @@ def antplus_meter_task(slot: MeterSlot, device_id: int, reading_queue: queue.Que
                 cadence = float(data.cadence) if data.cadence is not None else None
             except (TypeError, ValueError):
                 power, cadence = 0, None
+
+            # If we paired with the wildcard ID (0), capture the actual
+            # channel device number from openant the first time data lands
+            # so the slot name and CSV reflect the real meter. The exact
+            # attribute name depends on the openant version - probe a few.
+            if slot.address_or_id == "0":
+                for attr in ("device_number", "device_id", "_device_number"):
+                    v = getattr(slot.ant_device, attr, None)
+                    if isinstance(v, int) and v != 0:
+                        slot.address_or_id = str(v)
+                        slot.name = f"ANT+ {v} (wildcard-paired)"
+                        reading_queue.put(("ANT_RESOLVED", slot.slot_id, v))
+                        break
 
             reading_queue.put(PowerReading(
                 slot=slot.slot_id,
@@ -1782,7 +1796,8 @@ class PowerMeterApp:
             sw["device_label_var"].set("Device (BLE MAC, or pick from Scan):")
         else:
             sw["device_label_var"].set(
-                "Device (ANT+ device ID, e.g. 12345; 0 = pair with first found):"
+                "Device (ANT+ ID from your head unit / Garmin Connect, "
+                "NOT the pedal serial; 0 = pair with first found, recommended):"
             )
 
     # -- Scanning ------------------------------------------------------------
@@ -1853,6 +1868,10 @@ class PowerMeterApp:
         # Reset calibration-related state for the new connection.
         slot.features = 0
         slot.crank_length_mm = None
+        # Reset the no-data timer so a previously-connected slot doesn't
+        # immediately flash a stale "no data" hint on reconnect.
+        slot.last_update = 0.0
+        slot.connect_started = time.time()
         # Clear any sticky error status from the previous attempt.
         sw["had_error"] = False
 
@@ -1887,22 +1906,36 @@ class PowerMeterApp:
                     "type the device ID printed on/in your meter's app.",
                 )
                 return
-            # ANT+ channel device numbers are 16-bit. A handful of meters
-            # (Garmin pedals in particular) print the full 32-bit hardware
-            # serial - that number won't fit in the channel-ID slot, but the
-            # low 16 bits are what actually pair on the air. Mask quietly
-            # rather than rejecting; surface the resolved ID in the name so
-            # the user can sanity-check against their head unit.
-            device_id = raw_id & 0xFFFF
-            slot.address_or_id = str(device_id)
-            if device_id == raw_id:
-                slot.name = f"ANT+ {device_id}"
+            # ANT+ channel device numbers are 16-bit. If the user typed a
+            # value bigger than that, it's almost certainly the pedal/meter
+            # *serial number* (Garmin Rally / Vector print a 32-bit serial
+            # that isn't the same as the ANT+ ID). The low 16 bits won't
+            # match the channel device number on the air, so falling back
+            # to wildcard pairing (device_id=0) is the right move - openant
+            # then matches the first power meter that responds and we
+            # capture the actual channel ID once data starts flowing.
+            if raw_id > 0xFFFF:
+                if not messagebox.askyesno(
+                    "ANT+ ID > 16 bits",
+                    f"The number you entered ({raw_id}) is bigger than an "
+                    f"ANT+ device ID can be (max 65535). It looks like a "
+                    f"hardware serial number.\n\n"
+                    f"For Garmin Rally / Vector pedals, the ANT+ ID is "
+                    f"shown in Garmin Connect under Device > Sensor info "
+                    f"> ANT ID, and is usually a 5-digit number unrelated "
+                    f"to the serial.\n\n"
+                    f"Pair with the first power meter found instead "
+                    f"(recommended)? Click Yes for wildcard pairing.",
+                ):
+                    return
+                device_id = 0
+                slot.address_or_id = "0"
+                slot.name = f"ANT+ wildcard (was {raw_id})"
             else:
-                slot.name = f"ANT+ {device_id} (from {raw_id})"
-                print(
-                    f"[Slot {slot_id}] ANT+ ID {raw_id} > 0xFFFF; "
-                    f"using low 16 bits ({device_id}) for channel match."
-                )
+                device_id = raw_id
+                slot.address_or_id = str(device_id)
+                slot.name = (f"ANT+ {device_id}" if device_id != 0
+                             else "ANT+ wildcard")
             t = threading.Thread(
                 target=antplus_meter_task,
                 args=(slot, device_id, self.reading_queue, stop_event),
@@ -2047,6 +2080,12 @@ class PowerMeterApp:
                 # reveal the trainer-control panel inside its frame.
                 slot_id = item[1]
                 self._show_trainer_panel(slot_id)
+            elif tag == "ANT_RESOLVED":
+                # Wildcard ANT+ pairing succeeded - log the actual channel
+                # device number we paired with so the user can compare it
+                # to what their head unit / Garmin Connect shows.
+                slot_id, device_number = item[1], item[2]
+                print(f"[Slot {slot_id}] ANT+ wildcard paired with device {device_number}")
 
     def _refresh_displays(self):
         """Update each slot's power/cadence labels and the comparison footer."""
@@ -2076,6 +2115,19 @@ class PowerMeterApp:
             else:
                 sw["power_var"].set("—")
                 sw["cadence_var"].set("cadence: —")
+                # Worker is up (we have a stop_event) but we've never seen a
+                # reading after 15s? Most likely the ANT+ ID doesn't match
+                # any meter on the air. Surface that as a status hint - no
+                # popup, just a coloured line so it's visible at a glance.
+                if (slot.stop_event is not None
+                        and slot.last_update == 0.0
+                        and slot.connect_started > 0
+                        and now - slot.connect_started > 15
+                        and slot.protocol == "ANT+"):
+                    sw["status_var"].set(
+                        "● no data — wrong ANT+ ID? try 0 (wildcard)"
+                    )
+                    sw["status_label"].config(foreground="orange")
 
         # Comparison: show min, max, spread between live meters.
         if len(live_powers) >= 2:
