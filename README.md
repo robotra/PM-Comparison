@@ -152,8 +152,28 @@ If `openant` doesn't get bundled correctly, add `--collect-all openant`.
 ## Troubleshooting
 
 - **BLE scan finds nothing** — Bluetooth is off, or the meter isn't advertising (some meters only advertise after a wake-up pedal stroke).
-- **ANT+ "no device found"** — wrong driver. On Windows, run Zadig and replace the Garmin/Dynastream USB driver with WinUSB.
+- **ANT+ "Access denied (insufficient permissions)" / `USBError [Errno 13]`** — the stick is enumerated but the Windows driver bound to it isn't WinUSB, so libusb can't claim the interface. See the [Zadig walkthrough](#zadig-walkthrough-windows-ant-driver-swap) below.
+- **ANT+ "no device found"** — same root cause as above, or the stick isn't plugged in. Run the Zadig walkthrough.
 - **Calibration says "Operation not permitted"** — the meter is asleep. Pedal once and retry.
 - **Calibration says "Operation not supported"** — the meter doesn't expose that command on this protocol. Garmin Vector/Rally and similar dual-protocol pedals usually expose calibration only on ANT+; switch the slot to ANT+ and retry. Otherwise fall back to Garmin Connect / your head unit.
 - **Trainer panel never appears** — the device you connected doesn't expose the BLE Fitness Machine Service (`0x1826`). Some smart trainers expose FTMS only when not paired to another app — quit Zwift/TrainerRoad and reconnect.
+
+## Zadig walkthrough (Windows ANT+ driver swap)
+
+`USBError [Errno 13] Access denied` means Windows enumerated the ANT+ stick but bound a non-libusb-compatible driver to it (typically the Dynastream/Garmin one). libusb can claim the interface only if the driver is **WinUSB**.
+
+1. Unplug the ANT+ stick. Close anything that grabs it: **Garmin Express**, **ANT Agent**, Zwift, TrainerRoad, etc. Without this, Zadig sees the stick as "in use" and Replace Driver fails halfway through.
+2. Download Zadig from <https://zadig.akeo.ie/> and right-click → **Run as administrator**. This matters — without admin, the replace step exits with an access-denied error of its own.
+3. Plug the stick back in.
+4. In Zadig: **Options → List All Devices** (otherwise the stick won't be in the dropdown).
+5. From the dropdown, select the ANT+ device by USB ID:
+   - `0FCF 1008` — Garmin USB ANT Stick (most common)
+   - `0FCF 1009` — ANTUSB-m
+   - `0FCF 1004` — older ANTUSB
+   Don't pick anything with a different vendor ID (`0FCF` is Dynastream/Garmin).
+6. The line under the dropdown shows `Driver: <current> → <target>`. Use the up/down arrows next to the *target* to choose **WinUSB** (NOT libusbK or libusb-win32 — openant's pyusb backend looks for WinUSB specifically).
+7. Click **Replace Driver**. The button label may say *Install Driver* if no current driver is bound. Either is fine. Wait ~30s.
+8. Close Zadig. Restart this app and connect the ANT+ slot.
+
+To undo (e.g. you want to use the stick with Garmin Express again): in Device Manager, right-click the ANT USB-m → *Uninstall device*, then unplug & replug — Windows will reinstall the original Dynastream driver.
 - **Buttons frozen during connect** — fixed. If you still see this, you're running an older revision; pull the latest [power_meter_app.py](power_meter_app.py).
