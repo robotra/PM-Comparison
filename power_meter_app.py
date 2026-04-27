@@ -99,6 +99,22 @@ def _ensure_libusb_dll_path():
 # Run before importing openant so its lazy-loaded pyusb backend resolves.
 _ensure_libusb_dll_path()
 
+
+def _quiet_pyusb_kernel_warning():
+    """Suppress pyusb's harmless 'kernel driver active' warning on Windows.
+
+    pyusb logs `Could not check if kernel driver was active, not implemented
+    in usb backend` every time openant opens a channel. The check is only
+    meaningful on Linux (where the kernel can be driving the device); on
+    Windows it's both wrong and noisy. We bump the logger to ERROR so real
+    failures still surface but the false alarm doesn't.
+    """
+    import logging
+    logging.getLogger("usb.core").setLevel(logging.ERROR)
+
+
+_quiet_pyusb_kernel_warning()
+
 try:
     from openant.easy.node import Node
     from openant.devices import ANTPLUS_NETWORK_KEY
