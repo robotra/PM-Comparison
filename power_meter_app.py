@@ -101,16 +101,18 @@ _ensure_libusb_dll_path()
 
 
 def _quiet_pyusb_kernel_warning():
-    """Suppress pyusb's harmless 'kernel driver active' warning on Windows.
+    """Suppress pyusb's harmless 'kernel driver active' warnings on Windows.
 
-    pyusb logs `Could not check if kernel driver was active, not implemented
-    in usb backend` every time openant opens a channel. The check is only
-    meaningful on Linux (where the kernel can be driving the device); on
-    Windows it's both wrong and noisy. We bump the logger to ERROR so real
-    failures still surface but the false alarm doesn't.
+    pyusb logs both `Could not check if kernel driver was active` (on open)
+    and `Could not re-attach kernel driver` (on close) every time openant
+    touches a channel. The check is Linux-specific (Windows doesn't attach
+    kernel drivers to USB endpoints the same way), so on this platform the
+    message is just noise that looks like an error. Bumping the whole `usb`
+    logger tree to ERROR keeps real failures visible while dropping the
+    false alarms - covers usb.core, usb.backend.libusb1, and friends.
     """
     import logging
-    logging.getLogger("usb.core").setLevel(logging.ERROR)
+    logging.getLogger("usb").setLevel(logging.ERROR)
 
 
 _quiet_pyusb_kernel_warning()
@@ -1038,12 +1040,11 @@ def antplus_meter_task(slot: MeterSlot, device_id: int, reading_queue: queue.Que
             msg += f"\n\n{hint}"
         reading_queue.put(("ERROR", slot.slot_id, msg))
     finally:
-        # Clean shutdown - openant is finicky, so wrap each step in try.
-        try:
-            if device is not None:
-                device.close_channel()
-        except Exception:
-            pass
+        # Clean shutdown. openant's Node.stop() iterates the node's channels
+        # and closes each one itself - calling device.close_channel() first
+        # leaves the channel in a half-torn-down state and the subsequent
+        # node-level cleanup logs `Responded with error 21:
+        # CHANNEL_IN_WRONG_STATE`. We let node.stop() do the whole job.
         try:
             if node is not None:
                 node.stop()
