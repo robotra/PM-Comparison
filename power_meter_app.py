@@ -279,31 +279,75 @@ class MeterSlot:
 # BLE Cycling Power Measurement parsing
 # ---------------------------------------------------------------------------
 
-def parse_cycling_power_measurement(data: bytearray) -> tuple[int, Optional[float]]:
+def parse_cycling_power_measurement(
+    data: bytearray, prev: Optional[dict] = None,
+) -> tuple[int, Optional[float], dict]:
     """
     Parse a Cycling Power Measurement notification per BLE GATT spec.
 
     Layout (little-endian):
         Bytes 0-1: Flags (16-bit bitfield)
         Bytes 2-3: Instantaneous Power, signed 16-bit, in watts
-        ...optional fields follow depending on the flags.
+        ...optional fields follow, governed by the flag bits.
 
-    For our purposes we only need power. We return cadence as None; deriving
-    real-time cadence from the spec requires tracking crank revolutions
-    between notifications, which is more complexity than this hobbyist app
-    needs. (Cadence over ANT+, by contrast, comes pre-calculated.)
+    Crank cadence isn't carried directly: the spec gives cumulative crank
+    revolutions (uint16) and the time of the last crank event (uint16, units
+    of 1/1024 s). To get rpm we diff the cumulative count and the event time
+    against the previous notification. Both fields wrap (1024-second event
+    counter and 65535-revolution counter), so we mod the deltas back into
+    range. `prev` carries the last (revs, event_time) pair across calls;
+    the fresh values are returned in the third element so the caller can
+    feed them into the next invocation.
 
-    Returns (power_watts, cadence_rpm_or_None).
+    Returns `(power_watts, cadence_rpm_or_None, new_state)`.
     """
+    state = dict(prev) if prev else {}
     if len(data) < 4:
-        return 0, None
+        return 0, None, state
+
+    flags = int.from_bytes(data[0:2], "little")
+    # Optional fields follow Power, in spec order:
+    # bit 0: Pedal Power Balance Present (1 byte)
+    # bit 1: Pedal Power Balance Reference (no extra bytes)
+    # bit 2: Accumulated Torque Present (2 bytes)
+    # bit 3: Accumulated Torque Source (no extra bytes)
+    # bit 4: Wheel Revolution Data Present (4 + 2 bytes)
+    # bit 5: Crank Revolution Data Present (2 + 2 bytes) <-- what we need
+    offset = 4
+    if flags & (1 << 0):  # pedal power balance
+        offset += 1
+    if flags & (1 << 2):  # accumulated torque
+        offset += 2
+    if flags & (1 << 4):  # wheel rev data
+        offset += 6
+
+    cadence_rpm: Optional[float] = None
+    if flags & (1 << 5) and len(data) >= offset + 4:
+        revs = int.from_bytes(data[offset:offset + 2], "little")
+        event_time = int.from_bytes(data[offset + 2:offset + 4], "little")
+        prev_revs = state.get("revs")
+        prev_event_time = state.get("event_time")
+        if prev_revs is not None and prev_event_time is not None:
+            d_revs = (revs - prev_revs) & 0xFFFF
+            d_time = (event_time - prev_event_time) & 0xFFFF  # 1/1024 s units
+            if d_time > 0 and d_revs > 0:
+                seconds = d_time / 1024.0
+                cadence_rpm = (d_revs / seconds) * 60.0
+            elif d_time > 0 and d_revs == 0:
+                # Time advanced but no new revolution = the rider isn't
+                # pedalling. Reporting 0 is more useful than holding the
+                # last value, since the live readout would otherwise sit
+                # at the last cadence after the rider stops.
+                cadence_rpm = 0.0
+        state["revs"] = revs
+        state["event_time"] = event_time
 
     # Bytes 2-3 are signed instantaneous power. Negative values are valid
     # (some meters report small negatives during coasting), but for display
     # we clamp negatives to 0 so the UI doesn't look broken.
     power = int.from_bytes(data[2:4], byteorder="little", signed=True)
     power = max(0, power)
-    return power, None
+    return power, cadence_rpm, state
 
 
 # ---------------------------------------------------------------------------
@@ -540,10 +584,17 @@ async def ble_meter_task(slot: MeterSlot, address: str, reading_queue: queue.Que
             except Exception:
                 slot.features = 0
 
+            # Closure-local state for the cadence derivation: parser needs to
+            # diff successive crank-revolution counters across notifications.
+            cadence_state: dict = {}
+
             # Callback fires every time the meter sends a power notification
             # (typically once per second, sometimes faster).
             def on_notify(_char, data: bytearray):
-                power, cadence = parse_cycling_power_measurement(data)
+                nonlocal cadence_state
+                power, cadence, cadence_state = parse_cycling_power_measurement(
+                    data, cadence_state
+                )
                 reading_queue.put(PowerReading(
                     slot=slot.slot_id,
                     timestamp=time.time(),
@@ -946,12 +997,30 @@ def antplus_meter_task(slot: MeterSlot, device_id: int, reading_queue: queue.Que
 
         def on_power_data(page: int, page_name: str, data: PowerData):
             # openant fires this callback whenever a power data page arrives.
-            # `data.instantaneous_power` is in watts; `data.cadence` is rpm.
+            # `data.instantaneous_power` is in watts; cadence's attribute
+            # name varies by openant version and meter subtype - we probe
+            # the likely candidates and take the first non-None.
             try:
                 power = int(data.instantaneous_power) if data.instantaneous_power is not None else 0
-                cadence = float(data.cadence) if data.cadence is not None else None
             except (TypeError, ValueError):
-                power, cadence = 0, None
+                power = 0
+            cadence: Optional[float] = None
+            for attr in ("cadence", "instantaneous_cadence", "cadence_rpm",
+                         "crank_cadence"):
+                v = getattr(data, attr, None)
+                if v is None:
+                    continue
+                try:
+                    fv = float(v)
+                except (TypeError, ValueError):
+                    continue
+                # Some openant versions emit 0xFF as the "invalid" sentinel
+                # for cadence on certain pages - filter those out so the UI
+                # doesn't briefly flash 255 rpm.
+                if fv >= 255:
+                    continue
+                cadence = fv
+                break
 
             # If we paired with the wildcard ID (0), capture the actual
             # channel device number from openant the first time data lands
@@ -1472,6 +1541,7 @@ class PowerMeterApp:
     POLL_INTERVAL_MS = 100   # How often we drain the queue and refresh UI
     STALE_AFTER_SEC = 3.0    # If no reading for this long, show power as 0
     SLOT_PANEL_WIDTH = 280   # Fixed slot-panel width so horizontal scroll works
+    RECORD_TICK_MS = 1000    # Wide-format CSV row cadence (1 Hz)
 
     def __init__(self, root: tk.Tk):
         self.root = root
@@ -1503,6 +1573,12 @@ class PowerMeterApp:
         self.csv_writer = None
         self.recording_start_time: Optional[float] = None
         self.session_name: Optional[str] = None
+        # Snapshot of slot_ids (in column order) taken at recording start.
+        # New slots added mid-recording don't get retroactive columns -
+        # CSV columns are fixed at start. Disconnected slots keep their
+        # column and get blank cells when their data goes stale.
+        self._record_slot_ids: list[int] = []
+        self._record_tick_id: Optional[str] = None
 
         # Persisted state (last-used crank length per meter, etc.)
         self.config = self._load_config()
@@ -1588,9 +1664,16 @@ class PowerMeterApp:
                                     font=("Segoe UI", 11))
         self.diff_label.pack(side="left")
 
+        # Explicit Quit button. Goes through the same cleanup path as the
+        # window-close (X) handler so workers/recordings always wind down
+        # cleanly regardless of how the user exits.
+        self.quit_btn = ttk.Button(bottom, text="Quit",
+                                   command=self._on_close)
+        self.quit_btn.pack(side="right")
+
         self.record_btn = ttk.Button(bottom, text="Start Recording",
                                      command=self._toggle_recording)
-        self.record_btn.pack(side="right")
+        self.record_btn.pack(side="right", padx=(0, 6))
 
         # Mid-session note - enabled only while a recording is active.
         self.add_note_btn = ttk.Button(bottom, text="Add note...", state="disabled",
@@ -2036,8 +2119,9 @@ class PowerMeterApp:
             # First reading? Allow the user to open the calibration dialog.
             if str(sw["calibrate_btn"]["state"]) == "disabled":
                 sw["calibrate_btn"].config(state="normal")
-            if self.recording and self.csv_writer:
-                self._write_recording_row(item)
+            # CSV writes are now driven by _record_tick on a fixed cadence
+            # (one wide row per RECORD_TICK_MS), so we don't write anything
+            # per-reading here - the tick reads slot.latest_power instead.
             return
 
         if isinstance(item, tuple):
@@ -2571,24 +2655,46 @@ class PowerMeterApp:
             messagebox.showerror("Can't open file", str(e))
             return
 
+        # Snapshot the slot list at recording start so columns are stable
+        # for the whole file. New slots added mid-recording don't get a
+        # column (they'd require rewriting the header); removed slots keep
+        # theirs and just record blanks once their data goes stale.
+        self._record_slot_ids = [s.slot_id for s in self.slots]
+
         # Metadata header as comment lines. Tools like pandas can skip these
         # via `comment='#'`; eyeballing the file at the top stays readable.
         started = datetime.now().isoformat(timespec="seconds")
         self.recording_file.write(f"# session_name: {info['name']}\n")
         self.recording_file.write(f"# started: {started}\n")
+        self.recording_file.write(f"# tick_hz: {1000 / self.RECORD_TICK_MS:g}\n")
         if info["notes"]:
             self.recording_file.write("# notes:\n")
             for line in info["notes"].splitlines():
                 self.recording_file.write(f"#   {line}\n")
+        # Per-slot identity in the metadata so the bare s1/s2/... column
+        # names map back to physical meters when you open the CSV later.
+        self.recording_file.write("# columns:\n")
+        for sid in self._record_slot_ids:
+            slot = self._slot(sid)
+            if slot is None:
+                continue
+            label = slot.name or f"slot {sid}"
+            ident = slot.address_or_id or "-"
+            self.recording_file.write(
+                f"#   s{sid} = {slot.protocol} {label} ({ident})\n"
+            )
         self.recording_file.flush()
 
         self.csv_writer = csv.writer(self.recording_file)
-        # Header row. elapsed_s is seconds since recording started, which is
-        # the column that's most useful for plotting later.
-        self.csv_writer.writerow([
-            "timestamp_iso", "elapsed_s", "slot", "protocol",
-            "name", "power_w", "cadence_rpm",
-        ])
+        # Wide header: timestamp + elapsed + (power_w, cadence_rpm) per slot.
+        # Column prefix is sN where N is the slot_id - matches the metadata
+        # block above so a future reader can join columns to slot identity.
+        header = ["timestamp_iso", "elapsed_s"]
+        for sid in self._record_slot_ids:
+            header.append(f"s{sid}_power_w")
+            header.append(f"s{sid}_cadence_rpm")
+        self.csv_writer.writerow(header)
+
         self.recording_start_time = time.time()
         self.recording = True
         self.session_name = info["name"]
@@ -2597,6 +2703,11 @@ class PowerMeterApp:
         self.record_status.config(
             text=f"Recording '{info['name']}' -> {info['path']}",
             foreground="red",
+        )
+        # Kick off the periodic tick. _record_tick re-arms itself while
+        # self.recording stays True.
+        self._record_tick_id = self.root.after(
+            self.RECORD_TICK_MS, self._record_tick
         )
 
     def _add_note(self):
@@ -2617,25 +2728,53 @@ class PowerMeterApp:
         self.recording_file.write(f"# note @ {elapsed:.1f}s: {flat}\n")
         self.recording_file.flush()
 
-    def _write_recording_row(self, reading: PowerReading):
-        slot = self._slot(reading.slot)
-        if slot is None:
+    def _record_tick(self):
+        """Write one wide-format row with the latest power/cadence per slot.
+
+        Runs on a self-rescheduling `root.after` chain while `self.recording`
+        is True. Cells go blank for slots whose data is stale (no reading
+        within `STALE_AFTER_SEC`) so the file shows gaps rather than
+        forward-filling stale values forever.
+        """
+        if not self.recording or self.csv_writer is None:
+            self._record_tick_id = None
             return
-        elapsed = reading.timestamp - (self.recording_start_time or reading.timestamp)
-        self.csv_writer.writerow([
-            datetime.fromtimestamp(reading.timestamp).isoformat(timespec="milliseconds"),
+        now = time.time()
+        elapsed = now - (self.recording_start_time or now)
+        row = [
+            datetime.fromtimestamp(now).isoformat(timespec="milliseconds"),
             f"{elapsed:.3f}",
-            reading.slot,
-            slot.protocol,
-            slot.name,
-            reading.power_watts,
-            f"{reading.cadence_rpm:.1f}" if reading.cadence_rpm is not None else "",
-        ])
-        # Flush every row so a crash doesn't lose your ride.
+        ]
+        for sid in self._record_slot_ids:
+            slot = self._slot(sid)
+            if (slot is None
+                    or slot.last_update == 0.0
+                    or (now - slot.last_update) > self.STALE_AFTER_SEC):
+                row.append("")  # power
+                row.append("")  # cadence
+                continue
+            row.append(str(slot.latest_power))
+            row.append(
+                f"{slot.latest_cadence:.1f}"
+                if slot.latest_cadence is not None else ""
+            )
+        self.csv_writer.writerow(row)
+        # Flush every tick so a crash doesn't lose more than one second.
         self.recording_file.flush()
+        self._record_tick_id = self.root.after(
+            self.RECORD_TICK_MS, self._record_tick
+        )
 
     def _stop_recording(self):
         self.recording = False
+        # Stop the periodic tick before closing the file so a tick can't
+        # fire after we've nulled out csv_writer/recording_file.
+        if self._record_tick_id is not None:
+            try:
+                self.root.after_cancel(self._record_tick_id)
+            except Exception:
+                pass
+            self._record_tick_id = None
         if self.recording_file:
             ended = datetime.now().isoformat(timespec="seconds")
             self.recording_file.write(f"# ended: {ended}\n")
@@ -2643,6 +2782,7 @@ class PowerMeterApp:
             self.recording_file = None
         self.csv_writer = None
         self.session_name = None
+        self._record_slot_ids = []
         self.record_btn.config(text="Start Recording")
         self.add_note_btn.config(state="disabled")
         self.record_status.config(text="Not recording", foreground="gray")
@@ -2650,17 +2790,44 @@ class PowerMeterApp:
     # -- Shutdown ------------------------------------------------------------
 
     def _on_close(self):
-        # Tell every worker to stop, give them a beat, then exit.
+        # Idempotent: the WM_DELETE_WINDOW handler and the Quit button both
+        # land here, and a second call after the root is gone would error.
+        if getattr(self, "_closing", False):
+            return
+        self._closing = True
+
+        # Stop any text-driven workouts so the trainer doesn't keep getting
+        # commands during shutdown.
+        for slot in list(self.slots):
+            self._trainer_cancel_schedule(slot.slot_id, silent=True)
+
+        # Tell every worker to stop. Each worker watches its own stop_event.
         for slot in self.slots:
             if slot.stop_event is not None:
                 slot.stop_event.set()
+
+        # Stop the periodic record tick and close the file cleanly.
         if self.recording:
             self._stop_recording()
-        # Don't wait too long - daemon threads will die with the process anyway.
-        time.sleep(0.3)
+
+        # Disable the Quit button so a fast double-click can't queue a
+        # second close pass while the first is still unwinding.
+        try:
+            self.quit_btn.config(state="disabled", text="Quitting...")
+        except (AttributeError, tk.TclError):
+            pass
+
+        # Give workers a beat to finish their finally blocks (BLE worker
+        # tries an FTMS reset, ANT+ worker tears down the channel). Daemon
+        # threads will die with the process anyway, but this avoids the
+        # trainer holding the last commanded ERG target after we walk away.
+        time.sleep(0.4)
         if self.async_thread is not None:
             self.async_thread.stop()
-        self.root.destroy()
+        try:
+            self.root.destroy()
+        except tk.TclError:
+            pass
 
 
 # ---------------------------------------------------------------------------

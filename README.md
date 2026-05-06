@@ -110,14 +110,22 @@ The parser is case-insensitive, whitespace-tolerant, and supports the following 
 
 ## CSV format
 
+Wide format — one row per tick (1 Hz by default), one power+cadence column pair per slot. Slot identity is captured in a comment header so the bare `s1`/`s2`/... column names map back to physical meters:
+
 ```
-timestamp_iso,elapsed_s,slot,protocol,name,power_w,cadence_rpm
-2026-04-27T10:15:32.412,0.000,1,BLE,Stages LR,212,84.0
-2026-04-27T10:15:32.512,0.100,2,ANT+ 12345,ANT+ 12345,215,84.5
+# session_name: Sat AM ride
+# started: 2026-04-27T10:15:31
+# tick_hz: 1
+# columns:
+#   s1 = BLE Stages LR (AA:BB:CC:DD:EE:FF)
+#   s2 = ANT+ 12345 (12345)
+timestamp_iso,elapsed_s,s1_power_w,s1_cadence_rpm,s2_power_w,s2_cadence_rpm
+2026-04-27T10:15:32.412,1.000,212,84.0,215,84.5
+2026-04-27T10:15:33.412,2.000,213,84.0,216,84.5
 ...
 ```
 
-`elapsed_s` is seconds since you clicked *Start Recording*. The file is flushed on every row, so a crash won't lose your ride.
+`elapsed_s` is seconds since you clicked *Start Recording*. The file is flushed every tick, so a crash loses at most one second. Cells go blank when a slot's data is stale (no reading in the last 3 s) instead of forward-filling stale values, so gaps in your ride are visible. Slots added mid-recording don't get a column — column layout is fixed at *Start Recording* time.
 
 ## Architecture
 
@@ -145,7 +153,7 @@ If `openant` doesn't get bundled correctly, add `--collect-all openant`.
 ## Known limitations
 
 - **No power balance** — left/right balance from dual-sided meters is not parsed or shown.
-- **No cadence over BLE** — the spec carries it but extracting it requires tracking crank revolutions across notifications. ANT+ provides cadence directly and that one *is* shown.
+- **Cadence on BLE** — the spec carries cumulative crank revolutions and an event timestamp rather than rpm directly, so the app derives rpm by diffing successive notifications. The first notification after connect therefore lands without cadence (no previous sample to diff against), and very low cadences (~< 30 rpm) update slowly. Meters that don't set the crank-revolution-data flag give no cadence at all over BLE.
 - **Multiple ANT+ meters on one stick** — the worker opens its own Node per slot, so multiple ANT+ slots want multiple sticks. Mixing one ANT+ slot with several BLE slots on a single stick works fine.
 - **ANT+ calibration is best-effort** — page formats follow the spec, but pedal implementations vary. Verify with your head unit before trusting an in-app result.
 
